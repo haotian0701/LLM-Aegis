@@ -46,6 +46,6 @@ On Windows, use `python -m aegis` as shown above: Psycopg's async connections re
 .\.venv\Scripts\pyright
 ```
 
-The HTTP tests use an in-memory storage test double. PostgreSQL persistence and Alembic migrations require the Docker database. The current API and failure behavior are described in [the stage 0 contract](docs/STAGE_0_CONTRACT.md).
+The HTTP tests use an in-memory storage test double. PostgreSQL persistence and Alembic migrations require the Docker database.
 
 To include the PostgreSQL integration check after running migrations, set `AEGIS_TEST_DATABASE_URL` to the same database URL and rerun pytest. The integration test uses unique conversation IDs.
