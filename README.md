@@ -1,6 +1,6 @@
 # Aegis Gateway
 
-Stage 3 adds persistent conversation ownership, sensitive-state auditing, and explicit administration to the text-only gateway. It does not yet send requests to a cloud model or perform masking. Demo mode can use an external OpenAI-compatible service **only for semantic classification**; that service receives the original text, so use synthetic data only.
+Stage 4 adds a demo-only OpenAI-compatible cloud model route and request-scoped reversible masking. The external semantic classifier still receives the original supported message text **before masking**. Use synthetic data only.
 
 ## Run locally (PowerShell)
 
@@ -31,17 +31,28 @@ $env:AEGIS_SEMANTIC_API_KEY = 'replace-with-provider-key'
 $env:AEGIS_SEMANTIC_MODEL = 'replace-with-classifier-model'
 ```
 
-Only use synthetic messages in this configuration: the classifier receives all supported message text, including history and completed tool-call arguments. The service must return a Chat Completion whose assistant `content` is JSON in the form `{"results":[{"id":"messages[0].content","label":"CLEAR"}]}`; each input text ID needs exactly one `CLEAR`, `BUSINESS_SECRET`, or `UNCERTAIN` result. An incomplete or uncertain response fails closed. Strict mode cannot configure this external detector.
+Only use synthetic messages in this configuration: the classifier receives all forwarded message string fields, including history, message names, tool IDs, function names and completed tool-call arguments. The service must return a Chat Completion whose assistant `content` is JSON in the form `{"results":[{"id":"messages[0].content","label":"CLEAR"}]}`; each input text ID needs exactly one `CLEAR`, `BUSINESS_SECRET`, or `UNCERTAIN` result. An incomplete or uncertain response fails closed. Strict mode cannot configure this external detector.
+
+To send `CLOUD` and `MASK_CLOUD` model requests in demo mode, configure a separate cloud endpoint and credential. `AEGIS_CLOUD_BASE_URL` is the API root, such as `https://provider.example/v1`; Aegis appends `/chat/completions`. `AEGIS_MODEL_ALIASES_JSON` maps each client model alias to the actual cloud model ID. A partial cloud configuration prevents startup; with no cloud configuration, these routes return `ROUTE_UNAVAILABLE`.
+
+```powershell
+$env:AEGIS_CLOUD_BASE_URL = 'https://provider.example/v1'
+$env:AEGIS_CLOUD_API_KEY = 'replace-with-cloud-model-key'
+$env:AEGIS_MODEL_ALIASES_JSON = '{"aegis-demo":"replace-with-cloud-model-id"}'
+```
+
+The model route receives raw text for `CLOUD` and masked text for `MASK_CLOUD`. The external semantic classifier receives the original text first in both cases. Mask mappings stay in request memory and are discarded after response handling; they are never sent to the cloud or stored in PostgreSQL. A response containing an unresolved request placeholder fails with `SECURITY_UNAVAILABLE`.
 
 Try a locally blocked synthetic request in a second PowerShell session:
 
 ```powershell
 $headers = @{ Authorization = 'Bearer replace-with-a-long-random-client-token' }
 $body = @{ model = 'aegis-mock'; messages = @(@{ role = 'user'; content = 'api_key=abcdefghijklmnop12345' }) } | ConvertTo-Json -Depth 5
-Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:8000/v1/chat/completions' -Method Post -Headers $headers -ContentType 'application/json' -Body $body
+$bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:8000/v1/chat/completions' -Method Post -Headers $headers -ContentType 'application/json; charset=utf-8' -Body $bodyBytes
 ```
 
-The response is `403 POLICY_BLOCKED`; PowerShell may surface it as a web exception. Successful or failed valid requests return `X-Aegis-Conversation-Id`. Send it explicitly on later requests to reuse a conversation; omitting it starts a new one.
+Send JSON as UTF-8 bytes, especially from Windows PowerShell 5.1, so non-ASCII message text reaches Aegis unchanged. Windows PowerShell 5.1 can also decode a UTF-8 response as Latin-1; for a successful response, read `$response.RawContentStream.ToArray()` with `[System.Text.Encoding]::UTF8.GetString(...)` before `ConvertFrom-Json`. The response in the example is `403 POLICY_BLOCKED`; PowerShell may surface it as a web exception. Successful or failed valid requests return `X-Aegis-Conversation-Id`. Send it explicitly on later requests to reuse a conversation; omitting it starts a new one.
 
 ## Conversation ownership and administration
 
@@ -69,9 +80,10 @@ Recovery does not clear sensitive state. If the abandoned request has no committ
 | --- | --- |
 | `BLOCK` | `403 POLICY_BLOCKED`; no semantic or model call when local rules already determine the block. |
 | `LOCAL` | Demo calls the fixed Mock response; strict returns `503 LOCAL_UNAVAILABLE` without a trusted local provider. |
-| `CLOUD` / `MASK_CLOUD` | `503 ROUTE_UNAVAILABLE`; no cloud model call or masking occurs yet. |
+| `CLOUD` | Demo calls the configured cloud model after successful detection and audit; without cloud configuration, `503 ROUTE_UNAVAILABLE`. |
+| `MASK_CLOUD` | Demo masks located entities across all supported text fields, verifies the request, calls the cloud model, then restores response placeholders. Unsafe masking returns `503 SECURITY_UNAVAILABLE` without a model call. |
 
-The bundled YAML policy maps API keys and secrets to `BLOCK`, business secrets to `LOCAL`, and detected personal or network identifiers to `MASK_CLOUD`. A custom YAML file can be selected with `AEGIS_POLICY_PATH`; invalid or incomplete policies prevent startup. The request body limit is 128 KiB, and the extracted text limit is 32 KiB. `temperature`, `top_p`, and `max_tokens` remain unsupported by the Mock.
+The bundled YAML policy maps API keys and secrets to `BLOCK`, business secrets to `LOCAL`, and detected personal or network identifiers to `MASK_CLOUD`. A custom YAML file can be selected with `AEGIS_POLICY_PATH`; invalid or incomplete policies prevent startup. The request body limit is 128 KiB, and the extracted text limit is 32 KiB. Cloud requests forward `temperature`, `top_p`, and `max_tokens`; local Mock requests reject them. Strict mode continues to choose `LOCAL` because no trusted local semantic classifier is available.
 
 ## Check
 

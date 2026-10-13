@@ -45,10 +45,22 @@ def extract_fragments(request: ChatRequest) -> list[TextFragment]:
         if message.content:
             path = f"messages[{index}].content"
             fragments.append(TextFragment(path, index, path, message.content))
+        if message.name:
+            path = f"messages[{index}].name"
+            fragments.append(TextFragment(path, index, path, message.name))
+        if message.tool_call_id:
+            path = f"messages[{index}].tool_call_id"
+            fragments.append(TextFragment(path, index, path, message.tool_call_id))
         if message.tool_calls:
             for call_index, call in enumerate(message.tool_calls):
-                path = f"messages[{index}].tool_calls[{call_index}].function.arguments"
-                fragments.append(TextFragment(path, index, path, call.function.arguments))
+                base = f"messages[{index}].tool_calls[{call_index}]"
+                for field, value in (
+                    ("id", call.id),
+                    ("function.name", call.function.name),
+                    ("function.arguments", call.function.arguments),
+                ):
+                    path = f"{base}.{field}"
+                    fragments.append(TextFragment(path, index, path, value))
     return fragments
 
 

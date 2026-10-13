@@ -23,6 +23,8 @@ class Settings(BaseModel):
     semantic_url: str | None = None
     semantic_api_key: str | None = None
     semantic_model: str | None = None
+    cloud_base_url: str | None = None
+    cloud_api_key: str | None = None
 
     @model_validator(mode="after")
     def validate_security_settings(self) -> Settings:
@@ -48,16 +50,26 @@ class Settings(BaseModel):
         if self.run_mode == "strict" and any(semantic_values):
             raise ValueError("strict mode cannot load an external semantic detector")
         if self.semantic_url is not None:
-            parsed = urlsplit(self.semantic_url)
-            if parsed.username or parsed.password or parsed.query or parsed.fragment:
-                raise ValueError("semantic URL cannot contain credentials, query or fragment")
-            if parsed.scheme != "https" and not (
-                parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
-            ):
-                raise ValueError("semantic URL must use HTTPS outside loopback")
-            if not parsed.hostname:
-                raise ValueError("semantic URL needs a hostname")
+            self._validate_endpoint(self.semantic_url, "semantic URL")
+        if bool(self.cloud_base_url) != bool(self.cloud_api_key):
+            raise ValueError("cloud base URL and API key must be configured together")
+        if self.run_mode == "strict" and self.cloud_base_url is not None:
+            raise ValueError("strict mode cannot load an external cloud provider")
+        if self.cloud_base_url is not None:
+            self._validate_endpoint(self.cloud_base_url, "cloud base URL")
         return self
+
+    @staticmethod
+    def _validate_endpoint(value: str, name: str) -> None:
+        parsed = urlsplit(value)
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError(f"{name} cannot contain credentials, query or fragment")
+        if parsed.scheme != "https" and not (
+            parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+        ):
+            raise ValueError(f"{name} must use HTTPS outside loopback")
+        if not parsed.hostname:
+            raise ValueError(f"{name} needs a hostname")
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -84,5 +96,7 @@ class Settings(BaseModel):
                 "semantic_url": os.environ.get("AEGIS_SEMANTIC_URL") or None,
                 "semantic_api_key": os.environ.get("AEGIS_SEMANTIC_API_KEY") or None,
                 "semantic_model": os.environ.get("AEGIS_SEMANTIC_MODEL") or None,
+                "cloud_base_url": os.environ.get("AEGIS_CLOUD_BASE_URL") or None,
+                "cloud_api_key": os.environ.get("AEGIS_CLOUD_API_KEY") or None,
             }
         )

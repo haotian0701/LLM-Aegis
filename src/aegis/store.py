@@ -59,6 +59,10 @@ class RequestStore(Protocol):
         self, request_id: str, *, provider_name: str, model: str
     ) -> None: ...
 
+    async def record_model_intent(
+        self, request_id: str, *, provider_name: str, model: str, masked: bool
+    ) -> None: ...
+
     async def record_decision(
         self,
         request_id: str,
@@ -86,6 +90,8 @@ class RequestStore(Protocol):
         duration_ms: int,
         detection_status: str | None = None,
         semantic_call_status: str | None = None,
+        model_call_status: str | None = None,
+        masking_status: str | None = None,
         detected_categories: list[str] | None = None,
         detector_durations_ms: dict[str, int] | None = None,
     ) -> None: ...
@@ -205,6 +211,25 @@ class PostgresRequestStore:
             event.semantic_model = model
             event.semantic_call_status = "INTENDED"
 
+    async def record_model_intent(
+        self, request_id: str, *, provider_name: str, model: str, masked: bool
+    ) -> None:
+        async with self._sessions() as session, session.begin():
+            _, event = await self._owned_event(session, request_id)
+            if event.policy_action not in {Action.CLOUD.value, Action.MASK_CLOUD.value}:
+                raise RuntimeError("external model route was not selected")
+            if event.model_call_status is not None or masked != (
+                event.policy_action == "MASK_CLOUD"
+            ):
+                raise RuntimeError("external model intent is invalid")
+            event.actual_destination = "EXTERNAL"
+            event.provider_name = provider_name
+            event.provider_model = model
+            event.model_call_status = "INTENDED"
+            event.masked = masked
+            if masked:
+                event.masking_status = "SUCCEEDED"
+
     async def record_decision(
         self,
         request_id: str,
@@ -264,6 +289,8 @@ class PostgresRequestStore:
         duration_ms: int,
         detection_status: str | None = None,
         semantic_call_status: str | None = None,
+        model_call_status: str | None = None,
+        masking_status: str | None = None,
         detected_categories: list[str] | None = None,
         detector_durations_ms: dict[str, int] | None = None,
     ) -> None:
@@ -282,6 +309,14 @@ class PostgresRequestStore:
                 event.detection_status = detection_status
             if semantic_call_status is not None:
                 event.semantic_call_status = semantic_call_status
+            if model_call_status is not None:
+                if event.model_call_status != "INTENDED":
+                    raise RuntimeError("external model intent was not recorded")
+                event.model_call_status = model_call_status
+            elif event.model_call_status == "INTENDED":
+                event.model_call_status = "UNKNOWN"
+            if masking_status is not None:
+                event.masking_status = masking_status
             if detected_categories is not None:
                 event.detected_categories = detected_categories
             if detector_durations_ms is not None:
@@ -357,6 +392,8 @@ class PostgresRequestStore:
             event.conversation_state_version = conversation.state_version
             if event.semantic_call_status == "INTENDED":
                 event.semantic_call_status = "UNKNOWN"
+            if event.model_call_status == "INTENDED":
+                event.model_call_status = "UNKNOWN"
             conversation.active_request_id = None
             conversation.active_since = None
             session.add(

@@ -26,8 +26,9 @@ from aegis.detection import (
     text_bytes,
     unique_findings,
 )
+from aegis.masking import MaskingError, mask_request
 from aegis.policy import UPGRADE_CATEGORIES, Action, PolicyEngine
-from aegis.provider import MockLocalProvider, ModelProvider
+from aegis.provider import MockLocalProvider, ModelProvider, OpenAICompatibleCloudProvider
 from aegis.schemas import (
     ChatCompletionChoice,
     ChatCompletionMessage,
@@ -106,6 +107,7 @@ def create_app(
     *,
     store: RequestStore | None = None,
     provider: ModelProvider | None = None,
+    cloud_provider: ModelProvider | None = None,
     rule_detector: RuleDetector | None = None,
     ner_detector: NerDetector | None = None,
     semantic_detector: SemanticDetector | None = None,
@@ -118,6 +120,8 @@ def create_app(
             raise ValueError("strict mode cannot use a simulated provider")
         if semantic_detector is not None and semantic_detector.external:
             raise ValueError("strict mode cannot use an external semantic detector")
+        if cloud_provider is not None:
+            raise ValueError("strict mode cannot load an external cloud provider")
     elif provider is None:
         provider = MockLocalProvider()
 
@@ -132,6 +136,13 @@ def create_app(
             api_key=settings.semantic_api_key,
             model=settings.semantic_model,
         )
+    if settings.run_mode == "demo" and cloud_provider is None and settings.cloud_base_url:
+        assert settings.cloud_api_key is not None
+        cloud_provider = OpenAICompatibleCloudProvider(
+            base_url=settings.cloud_base_url,
+            api_key=settings.cloud_api_key,
+            model_aliases=settings.model_aliases,
+        )
 
     engine = None
     if store is None:
@@ -145,10 +156,11 @@ def create_app(
         if engine is not None:
             await engine.dispose()
 
-    app = FastAPI(title="Aegis Gateway", version="0.3.0", lifespan=lifespan)
+    app = FastAPI(title="Aegis Gateway", version="0.4.0", lifespan=lifespan)
     app.state.settings = settings
     app.state.store = store
     app.state.provider = provider
+    app.state.cloud_provider = cloud_provider
     app.state.policy = policy
 
     @app.get("/healthz")
@@ -196,20 +208,6 @@ def create_app(
             )
         if chat_request.model not in settings.model_aliases:
             return await reject(400, "INVALID_REQUEST", "Unknown model alias.", principal_id)
-        if any(
-            value is not None
-            for value in (
-                chat_request.temperature,
-                chat_request.top_p,
-                chat_request.max_tokens,
-            )
-        ):
-            return await reject(
-                400,
-                "UNSUPPORTED_FEATURE",
-                "Generation parameters are not supported by the current provider.",
-                principal_id,
-            )
         supplied_id = http_request.headers.get("x-aegis-conversation-id")
         if supplied_id is not None and CONVERSATION_ID_PATTERN.fullmatch(supplied_id) is None:
             return await reject(400, "INVALID_REQUEST", "Invalid conversation ID.", principal_id)
@@ -418,7 +416,9 @@ def create_app(
 
             status = "SUCCEEDED"
             error_code: str | None = None
-            response: JSONResponse
+            model_call_status: str | None = None
+            masking_status: str | None = None
+            response: JSONResponse | None = None
             if action == Action.BLOCK:
                 status = "BLOCKED"
                 error_code = "POLICY_BLOCKED"
@@ -426,12 +426,122 @@ def create_app(
                     403, error_code, "Request blocked by policy.", request_id, conversation_id
                 )
             elif action in {Action.CLOUD, Action.MASK_CLOUD}:
+                if cloud_provider is None:
+                    status = "FAILED"
+                    error_code = "ROUTE_UNAVAILABLE"
+                    response = _error(
+                        503,
+                        error_code,
+                        "Cloud provider is not configured.",
+                        request_id,
+                        conversation_id,
+                    )
+                else:
+                    outbound = chat_request
+                    masked_request = None
+                    if action == Action.MASK_CLOUD:
+                        try:
+                            masked_request = mask_request(chat_request, findings)
+                            outbound = masked_request.request
+                        except MaskingError:
+                            status = "FAILED"
+                            error_code = "SECURITY_UNAVAILABLE"
+                            masking_status = "FAILED"
+                            response = _error(
+                                503,
+                                error_code,
+                                "Request could not be safely masked.",
+                                request_id,
+                                conversation_id,
+                            )
+                    if error_code is None:
+                        try:
+                            await store.record_model_intent(
+                                request_id,
+                                provider_name=cloud_provider.name,
+                                model=settings.model_aliases[chat_request.model],
+                                masked=masked_request is not None,
+                            )
+                        except Exception:
+                            return _error(
+                                503,
+                                "AUDIT_UNAVAILABLE",
+                                "Audit storage is unavailable.",
+                                request_id,
+                                conversation_id,
+                            )
+                        try:
+                            result = await cloud_provider.complete(outbound)
+                            model_call_status = "SUCCEEDED"
+                            content = (
+                                masked_request.restore(result.content)
+                                if masked_request is not None
+                                else result.content
+                            )
+                            completion = ChatCompletionResponse(
+                                id=f"chatcmpl-{request_id}",
+                                created=int(datetime.now(UTC).timestamp()),
+                                model=chat_request.model,
+                                choices=[
+                                    ChatCompletionChoice(
+                                        message=ChatCompletionMessage(content=content),
+                                        finish_reason=result.finish_reason,
+                                    )
+                                ],
+                            )
+                            response = JSONResponse(
+                                content=completion.model_dump(),
+                                headers={
+                                    "X-Aegis-Request-Id": request_id,
+                                    "X-Aegis-Conversation-Id": conversation_id,
+                                },
+                            )
+                        except MaskingError:
+                            status = "FAILED"
+                            error_code = "SECURITY_UNAVAILABLE"
+                            response = _error(
+                                503,
+                                error_code,
+                                "Provider response could not be safely restored.",
+                                request_id,
+                                conversation_id,
+                            )
+                        except TimeoutError:
+                            status = "FAILED"
+                            error_code = "PROVIDER_TIMEOUT"
+                            model_call_status = "FAILED"
+                            response = _error(
+                                504,
+                                error_code,
+                                "Cloud provider timed out.",
+                                request_id,
+                                conversation_id,
+                            )
+                        except Exception:
+                            status = "FAILED"
+                            error_code = "PROVIDER_ERROR"
+                            model_call_status = "FAILED"
+                            response = _error(
+                                502,
+                                error_code,
+                                "Cloud provider failed.",
+                                request_id,
+                                conversation_id,
+                            )
+            elif any(
+                value is not None
+                for value in (
+                    chat_request.temperature,
+                    chat_request.top_p,
+                    chat_request.max_tokens,
+                )
+            ):
                 status = "FAILED"
-                error_code = "ROUTE_UNAVAILABLE"
+                error_code = "UNSUPPORTED_FEATURE"
                 response = _error(
-                    503,
+                    400,
                     error_code,
-                    "Selected route is not available yet.",
+                    "Generation parameters are not supported by the local provider.",
                     request_id,
                     conversation_id,
                 )
@@ -454,7 +564,8 @@ def create_app(
                         model=chat_request.model,
                         choices=[
                             ChatCompletionChoice(
-                                message=ChatCompletionMessage(content=result.content)
+                                message=ChatCompletionMessage(content=result.content),
+                                finish_reason=result.finish_reason,
                             )
                         ],
                     )
@@ -478,12 +589,15 @@ def create_app(
                         502, error_code, "Local provider failed.", request_id, conversation_id
                     )
 
+            assert response is not None
             try:
                 await store.finish_dispatch(
                     request_id,
                     status=status,
                     error_code=error_code,
                     duration_ms=max(0, round((time.perf_counter() - started) * 1000)),
+                    model_call_status=model_call_status,
+                    masking_status=masking_status,
                 )
             except Exception:
                 return _error(

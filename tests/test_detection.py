@@ -66,8 +66,11 @@ def test_tool_arguments_are_extracted_with_stable_paths() -> None:
     )
     fragments = extract_fragments(request)
     assert [item.path for item in fragments] == [
+        "messages[0].tool_calls[0].id",
+        "messages[0].tool_calls[0].function.name",
         "messages[0].tool_calls[0].function.arguments",
         "messages[1].content",
+        "messages[1].tool_call_id",
     ]
     assert RuleDetector().detect(fragments)[0].category == Category.EMAIL
 

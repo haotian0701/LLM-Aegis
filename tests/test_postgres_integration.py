@@ -15,6 +15,7 @@ from aegis.config import Settings
 from aegis.detection import Finding, TextFragment
 from aegis.main import create_app
 from aegis.models import AuditEvent, Conversation
+from aegis.provider import OpenAICompatibleCloudProvider
 from aegis.semantic import OpenAICompatibleSemanticDetector
 
 TEST_DATABASE_URL = os.getenv("AEGIS_TEST_DATABASE_URL")
@@ -132,5 +133,129 @@ async def test_stage_two_decisions_and_audits_persist() -> None:
             assert "synthetic merger plan" not in repr(
                 [(row.detected_categories, row.error_detail, row.prompt_hmac) for row in audits]
             )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.skipif(TEST_DATABASE_URL is None, reason="AEGIS_TEST_DATABASE_URL is not set")
+@pytest.mark.asyncio
+async def test_stage_four_cloud_masking_and_sensitive_state_persist() -> None:
+    assert TEST_DATABASE_URL is not None
+    conversation_id = f"integration-cloud-{uuid4().hex}"
+    settings = Settings(
+        database_url=TEST_DATABASE_URL,
+        api_keys={"integration-cloud": "cloud-client-token"},
+        hmac_key="integration-cloud-hmac-key-longer-than-32-bytes",
+        run_mode="demo",
+        demo_provider="mock",
+        model_aliases={"aegis-cloud": "upstream-model"},
+    )
+    classifier_texts: list[str] = []
+    cloud_bodies: list[dict[str, object]] = []
+
+    def classify(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        items = json.loads(payload["messages"][1]["content"])["items"]
+        classifier_texts.extend(item["text"] for item in items)
+        output = {
+            "results": [
+                {
+                    "id": item["id"],
+                    "label": "BUSINESS_SECRET" if "merger" in item["text"] else "CLEAR",
+                }
+                for item in items
+            ]
+        }
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(output)}}]})
+
+    def complete(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        cloud_bodies.append(payload)
+        content = payload["messages"][-1]["content"]
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"role": "assistant", "content": content}, "finish_reason": "stop"}
+                ]
+            },
+        )
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(classify)) as classifier_client,
+        httpx.AsyncClient(transport=httpx.MockTransport(complete)) as cloud_client,
+    ):
+        detector = OpenAICompatibleSemanticDetector(
+            url="https://semantic.example/v1/chat/completions",
+            api_key="semantic-key",
+            model="classifier",
+            client=classifier_client,
+        )
+        cloud = OpenAICompatibleCloudProvider(
+            base_url="https://cloud.example/v1",
+            api_key="cloud-key",
+            model_aliases=settings.model_aliases,
+            client=cloud_client,
+        )
+        app = create_app(
+            settings, semantic_detector=detector, cloud_provider=cloud, ner_detector=EmptyNer()
+        )
+        request_ids: list[str] = []
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                for text, expected in (
+                    ("Hello", 200),
+                    ("synthetic@example.org", 200),
+                    ("synthetic merger plan", 200),
+                    ("Hello again", 200),
+                ):
+                    result = await client.post(
+                        "/v1/chat/completions",
+                        headers={
+                            "Authorization": "Bearer cloud-client-token",
+                            "X-Aegis-Conversation-Id": conversation_id,
+                        },
+                        json={
+                            "model": "aegis-cloud",
+                            "messages": [{"role": "user", "content": text}],
+                        },
+                    )
+                    assert result.status_code == expected, result.text
+                    request_ids.append(result.headers["x-aegis-request-id"])
+                    if "@" in text:
+                        assert result.json()["choices"][0]["message"]["content"] == text
+
+    assert "synthetic@example.org" in classifier_texts
+    assert len(cloud_bodies) == 2
+    assert "synthetic@example.org" not in json.dumps(cloud_bodies)
+    assert "[[AEGIS_" in json.dumps(cloud_bodies[1])
+    engine = create_async_engine(TEST_DATABASE_URL)
+    sessions = async_sessionmaker(engine)
+    try:
+        async with sessions() as session:
+            conversation = await session.get(Conversation, ("integration-cloud", conversation_id))
+            audits = [await session.get(AuditEvent, request_id) for request_id in request_ids]
+            assert conversation is not None and conversation.sensitive is True
+            assert conversation.active_request_id is None
+            assert all(event is not None for event in audits)
+            cloud_audit, mask_audit, local_audit, later_audit = audits
+            assert cloud_audit is not None
+            assert mask_audit is not None
+            assert local_audit is not None
+            assert later_audit is not None
+            assert (cloud_audit.policy_action, cloud_audit.model_call_status) == (
+                "CLOUD",
+                "SUCCEEDED",
+            )
+            assert (mask_audit.policy_action, mask_audit.masking_status) == (
+                "MASK_CLOUD",
+                "SUCCEEDED",
+            )
+            assert (mask_audit.actual_destination, mask_audit.masked) == ("EXTERNAL", True)
+            assert mask_audit.semantic_destination == "EXTERNAL"
+            assert (local_audit.policy_action, later_audit.policy_action) == ("LOCAL", "LOCAL")
+            assert all("synthetic@example.org" not in repr(event.__dict__) for event in audits)
     finally:
         await engine.dispose()

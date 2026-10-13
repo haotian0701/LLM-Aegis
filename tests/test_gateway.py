@@ -32,6 +32,7 @@ class MemoryStore:
         self.versions: dict[tuple[str, str], int] = {}
         self.fail_begin = False
         self.fail_intent = False
+        self.fail_model_intent = False
         self.fail_decision = False
         self.fail_finish = False
 
@@ -60,6 +61,8 @@ class MemoryStore:
             "detected_categories": [],
             "detection_status": "PENDING",
             "semantic_call_status": None,
+            "model_call_status": None,
+            "masking_status": None,
             "conversation_state_before": state,
             "conversation_state_after": None,
             "conversation_state_version": self.versions[key],
@@ -96,6 +99,24 @@ class MemoryStore:
             semantic_provider_name=provider_name,
             semantic_model=model,
             semantic_call_status="INTENDED",
+        )
+
+    async def record_model_intent(
+        self, request_id: str, *, provider_name: str, model: str, masked: bool
+    ) -> None:
+        if self.fail_model_intent:
+            raise RuntimeError("database unavailable")
+        event = self.events[request_id]
+        assert self.active[(event["principal_id"], event["conversation_id"])] == request_id
+        assert event["policy_action"] in {"CLOUD", "MASK_CLOUD"}
+        assert masked == (event["policy_action"] == "MASK_CLOUD")
+        event.update(
+            actual_destination="EXTERNAL",
+            provider_name=provider_name,
+            provider_model=model,
+            model_call_status="INTENDED",
+            masked=masked,
+            masking_status="SUCCEEDED" if masked else None,
         )
 
     async def record_decision(
@@ -151,6 +172,8 @@ class MemoryStore:
         duration_ms: int,
         detection_status: str | None = None,
         semantic_call_status: str | None = None,
+        model_call_status: str | None = None,
+        masking_status: str | None = None,
         detected_categories: list[str] | None = None,
         detector_durations_ms: dict[str, int] | None = None,
     ) -> None:
@@ -166,6 +189,12 @@ class MemoryStore:
             event["detection_status"] = detection_status
         if semantic_call_status is not None:
             event["semantic_call_status"] = semantic_call_status
+        if model_call_status is not None:
+            event["model_call_status"] = model_call_status
+        elif event["model_call_status"] == "INTENDED":
+            event["model_call_status"] = "UNKNOWN"
+        if masking_status is not None:
+            event["masking_status"] = masking_status
         if detected_categories is not None:
             event["detected_categories"] = detected_categories
         if detector_durations_ms is not None:
@@ -458,7 +487,6 @@ async def test_business_secret_and_email_choose_local() -> None:
         (auth("wrong"), payload(), 401, "UNAUTHORIZED"),
         (auth(), {**payload(), "stream": True}, 400, "INVALID_REQUEST"),
         (auth(), {**payload(), "extra": "unscanned"}, 400, "INVALID_REQUEST"),
-        (auth(), {**payload(), "temperature": 0}, 400, "UNSUPPORTED_FEATURE"),
         ({**auth(), "X-Aegis-Conversation-Id": "bad id"}, payload(), 400, "INVALID_REQUEST"),
     ],
 )

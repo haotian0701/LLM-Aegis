@@ -82,6 +82,8 @@ class AuditEvent(Base):
     semantic_provider_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     semantic_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
     semantic_call_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    model_call_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    masking_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
     simulation: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     blocked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     masked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
