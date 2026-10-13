@@ -17,6 +17,7 @@ from aegis.main import create_app
 from aegis.models import AuditEvent, Conversation
 from aegis.provider import OpenAICompatibleCloudProvider, SimulatedLocalProvider
 from aegis.semantic import OpenAICompatibleSemanticDetector
+from aegis.store import PostgresRequestStore
 
 TEST_DATABASE_URL = os.getenv("AEGIS_TEST_DATABASE_URL")
 
@@ -133,6 +134,11 @@ async def test_stage_two_decisions_and_audits_persist() -> None:
             assert "synthetic merger plan" not in repr(
                 [(row.detected_categories, row.error_detail, row.prompt_hmac) for row in audits]
             )
+        summary_store = PostgresRequestStore(sessions)
+        summary = await summary_store.get_audit_summary(request_ids[2], "integration-alice")
+        assert summary is not None
+        assert (summary.policy_action, summary.detected_categories) == ("BLOCK", ["API_KEY"])
+        assert await summary_store.get_audit_summary(request_ids[2], "integration-bob") is None
     finally:
         await engine.dispose()
 

@@ -1,6 +1,6 @@
 # Aegis Gateway
 
-Stage 5 adds an explicit demo-only cloud simulation for `LOCAL` decisions and a loopback browser demo. A simulated `LOCAL` call sends the original message to an external model; it does not provide local isolation. The external semantic classifier also receives the original supported text **before masking**. Use synthetic data only.
+Stage 5 adds an explicit demo-only cloud simulation for `LOCAL` decisions and a loopback browser demo. Stage 6 begins with a route acceptance matrix and per-request audit details in that demo. A simulated `LOCAL` call sends the original message to an external model; it does not provide local isolation. The external semantic classifier also receives the original supported text **before masking**. Use synthetic data only.
 
 ## Run locally (PowerShell)
 
@@ -46,6 +46,12 @@ The model route receives raw text for `CLOUD` and masked text for `MASK_CLOUD`. 
 To use the configured cloud model for `LOCAL` decisions, explicitly set `AEGIS_DEMO_PROVIDER=simulated_local` instead of `mock` and restart Aegis. It reuses `AEGIS_CLOUD_BASE_URL`, `AEGIS_CLOUD_API_KEY`, and `AEGIS_MODEL_ALIASES_JSON`; incomplete cloud configuration prevents startup. This route is identified as `simulated-local-openai-compatible` in the audit, with `policy_action=LOCAL`, `actual_destination=EXTERNAL`, and `simulation=true` after model egress intent commits. Security failures and model errors do not fall back to another route.
 
 In demo mode, open **http://127.0.0.1:8000/** on the same computer for the browser demo. The page automatically uses a temporary, process-scoped token for its own audit principal; it never displays the configured long-lived client token. The page and temporary token are only available on loopback and disappear in strict mode. It provides synthetic examples for `CLOUD`, `MASK_CLOUD`, `BLOCK`, and a follow-up `LOCAL` request using the blocked conversation ID. The follow-up deliberately omits the earlier text to demonstrate persisted security state. The page sends only the current message, so a separate client must pass history when model context is needed.
+
+After each browser request, the page reads `/demo/audit/{request_id}` and shows detected categories, detection status, masking status, and model call status. The request ID can also be pasted into the lookup field. The endpoint accepts only the current process's browser token on loopback and returns records belonging to that browser principal; it returns no prompt text, Prompt HMAC, or credentials. `masking_status=SUCCEEDED` means the gateway validated the masked request and committed model egress intent. The outbound-payload acceptance test verifies what a fake cloud model actually receives:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_stage_six.py tests/test_cloud_routing.py::test_masked_history_and_tool_arguments_reach_cloud_as_placeholders -q
+```
 
 Completed decisions include `X-Aegis-Policy-Action`, `X-Aegis-Actual-Destination`, and `X-Aegis-Simulation` response headers. Errors before a policy decision do not include these headers.
 

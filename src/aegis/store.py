@@ -32,6 +32,22 @@ class BeginResult:
     was_sensitive: bool | None = None
 
 
+@dataclass(frozen=True)
+class AuditSummary:
+    request_id: str
+    conversation_id: str | None
+    status: str
+    policy_action: str | None
+    actual_destination: str
+    simulation: bool
+    detected_categories: list[str]
+    detection_status: str
+    semantic_call_status: str | None
+    masking_status: str | None
+    model_call_status: str | None
+    error_code: str | None
+
+
 class ConversationNotFound(Exception):
     pass
 
@@ -51,6 +67,10 @@ def _state(conversation: Conversation) -> str:
 
 
 class RequestStore(Protocol):
+    async def get_audit_summary(
+        self, request_id: str, principal_id: str
+    ) -> AuditSummary | None: ...
+
     async def record_rejection(self, draft: AuditDraft) -> None: ...
 
     async def begin_request(self, draft: AuditDraft) -> BeginResult: ...
@@ -100,6 +120,46 @@ class RequestStore(Protocol):
 class PostgresRequestStore:
     def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
         self._sessions = sessions
+
+    async def get_audit_summary(self, request_id: str, principal_id: str) -> AuditSummary | None:
+        async with self._sessions() as session:
+            row = (
+                await session.execute(
+                    select(
+                        AuditEvent.request_id,
+                        AuditEvent.conversation_id,
+                        AuditEvent.status,
+                        AuditEvent.policy_action,
+                        AuditEvent.actual_destination,
+                        AuditEvent.simulation,
+                        AuditEvent.detected_categories,
+                        AuditEvent.detection_status,
+                        AuditEvent.semantic_call_status,
+                        AuditEvent.masking_status,
+                        AuditEvent.model_call_status,
+                        AuditEvent.error_code,
+                    ).where(
+                        AuditEvent.request_id == request_id,
+                        AuditEvent.principal_id == principal_id,
+                    )
+                )
+            ).one_or_none()
+            if row is None:
+                return None
+            return AuditSummary(
+                request_id=row.request_id,
+                conversation_id=row.conversation_id,
+                status=row.status,
+                policy_action=row.policy_action,
+                actual_destination=row.actual_destination,
+                simulation=row.simulation,
+                detected_categories=row.detected_categories,
+                detection_status=row.detection_status,
+                semantic_call_status=row.semantic_call_status,
+                masking_status=row.masking_status,
+                model_call_status=row.model_call_status,
+                error_code=row.error_code,
+            )
 
     @staticmethod
     def _event(draft: AuditDraft) -> AuditEvent:

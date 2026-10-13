@@ -78,7 +78,19 @@
       <dt>模拟标志</dt><dd id="simulation">—</dd>
       <dt>请求 ID</dt><dd id="request-id">—</dd>
       <dt>会话 ID</dt><dd id="conversation-id">—</dd>
+      <dt>审计结果</dt><dd id="audit-status">—</dd>
+      <dt>检测类别</dt><dd id="categories">—</dd>
+      <dt>检测状态</dt><dd id="detection-status">—</dd>
+      <dt>语义调用状态</dt><dd id="semantic-status">—</dd>
+      <dt>脱敏状态</dt><dd id="masking-status">—</dd>
+      <dt>模型调用状态</dt><dd id="model-status">—</dd>
     </dl>
+    <p class="muted">脱敏状态为 SUCCEEDED 表示网关已完成替换和出站前校验；最终回复可能已还原。</p>
+    <label for="audit-request-id">按请求 ID 查看本页审计</label>
+    <div class="actions">
+      <input id="audit-request-id" maxlength="32" autocomplete="off" spellcheck="false" aria-label="审计请求 ID" style="max-width: 360px">
+      <button id="lookup-audit" class="secondary" type="button">查询审计</button>
+    </div>
   </section>
 </main>
 <script>
@@ -88,12 +100,61 @@
   let blockedConversation = null;
   let busy = false;
   const byId = id => document.getElementById(id);
-  const buttons = ["sample-cloud", "sample-mask", "sample-block", "sample-local", "send"];
+  const buttons = ["sample-cloud", "sample-mask", "sample-block", "sample-local", "send", "lookup-audit"];
   function setBusy(value) {
     busy = value;
     for (const id of buttons) byId(id).disabled = value || !token || (id === "sample-local" && !blockedConversation);
   }
+  function clearAudit() {
+    for (const id of ["audit-status", "categories", "detection-status", "semantic-status", "masking-status", "model-status"]) {
+      byId(id).textContent = "—";
+    }
+  }
+  async function loadAudit(requestId, manual = false) {
+    clearAudit();
+    if (manual) {
+      byId("status").textContent = "—";
+      byId("action").textContent = "—";
+      byId("destination").textContent = "—";
+      byId("simulation").textContent = "—";
+      byId("request-id").textContent = requestId || "—";
+      byId("conversation-id").textContent = "—";
+      byId("answer").textContent = "审计查询不包含模型回复。";
+    }
+    if (!/^[0-9a-f]{32}$/.test(requestId)) {
+      byId("audit-status").textContent = "请输入有效的请求 ID";
+      return;
+    }
+    byId("audit-status").textContent = "读取中…";
+    try {
+      const response = await fetch(`/demo/audit/${requestId}`, {
+        headers: { "Authorization": `Bearer ${token}` }, cache: "no-store", credentials: "omit"
+      });
+      if (!response.ok) {
+        byId("audit-status").textContent = response.status === 404 ? "未找到本页主体的记录" : "审计读取失败";
+        return;
+      }
+      const audit = await response.json();
+      if (manual) {
+        byId("action").textContent = audit.policy_action === "LOCAL" && audit.actual_destination === "EXTERNAL" && audit.simulation
+          ? "云端模拟本地路由" : (audit.policy_action || "未形成策略决定");
+        byId("destination").textContent = audit.actual_destination;
+        byId("simulation").textContent = String(audit.simulation);
+        byId("conversation-id").textContent = audit.conversation_id || "—";
+      }
+      byId("audit-status").textContent = audit.status;
+      byId("categories").textContent = audit.detected_categories.length
+        ? audit.detected_categories.join(", ") : "无命中";
+      byId("detection-status").textContent = audit.detection_status;
+      byId("semantic-status").textContent = audit.semantic_call_status || "未调用";
+      byId("masking-status").textContent = audit.masking_status || "未执行";
+      byId("model-status").textContent = audit.model_call_status || "未调用";
+    } catch (_) {
+      byId("audit-status").textContent = "审计读取失败";
+    }
+  }
   function showResult(response, body) {
+    clearAudit();
     const action = response.headers.get("X-Aegis-Policy-Action");
     const destination = response.headers.get("X-Aegis-Actual-Destination");
     const simulation = response.headers.get("X-Aegis-Simulation");
@@ -103,14 +164,16 @@
     byId("action").textContent = label;
     byId("destination").textContent = destination || "—";
     byId("simulation").textContent = simulation || "—";
-    byId("request-id").textContent = response.headers.get("X-Aegis-Request-Id") || "—";
+    const requestId = response.headers.get("X-Aegis-Request-Id");
+    byId("request-id").textContent = requestId || "—";
+    byId("audit-request-id").value = requestId || "";
     const conversation = response.headers.get("X-Aegis-Conversation-Id");
     byId("conversation-id").textContent = conversation || "—";
     if (conversation) byId("conversation").value = conversation;
     byId("answer").textContent = response.ok
       ? (body.choices?.[0]?.message?.content || "模型返回空内容。")
       : (body.error?.code || "请求失败") + ": " + (body.error?.message || "未知错误");
-    return conversation;
+    return { conversation, requestId };
   }
   async function send(text, conversationId, isBlockSample = false) {
     if (busy || !token || !text.trim()) return;
@@ -124,8 +187,9 @@
         body: JSON.stringify({ model: byId("model").value, messages: [{ role: "user", content: text }] })
       });
       const body = await response.json();
-      const returnedId = showResult(response, body);
-      if (isBlockSample && body.error?.code === "POLICY_BLOCKED") blockedConversation = returnedId;
+      const result = showResult(response, body);
+      if (isBlockSample && body.error?.code === "POLICY_BLOCKED") blockedConversation = result.conversation;
+      if (result.requestId) await loadAudit(result.requestId);
     } catch (_) {
       byId("answer").textContent = "网络请求失败；请确认 Aegis 仍在运行。";
     } finally { setBusy(false); }
@@ -136,6 +200,12 @@
   byId("sample-local").addEventListener("click", () => send("Summarize this synthetic follow-up in one sentence.", blockedConversation));
   byId("send").addEventListener("click", () => send(byId("prompt").value, byId("conversation").value.trim()));
   byId("new-conversation").addEventListener("click", () => { byId("conversation").value = ""; });
+  byId("lookup-audit").addEventListener("click", async () => {
+    if (busy || !token) return;
+    setBusy(true);
+    try { await loadAudit(byId("audit-request-id").value.trim(), true); }
+    finally { setBusy(false); }
+  });
   setBusy(false);
   fetch("/demo/bootstrap", { cache: "no-store", credentials: "omit" })
     .then(response => { if (!response.ok) throw new Error("bootstrap failed"); return response.json(); })

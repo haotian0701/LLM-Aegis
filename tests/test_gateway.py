@@ -17,7 +17,7 @@ from aegis.policy import Action, Category, PolicyEngine
 from aegis.provider import ProviderResult
 from aegis.schemas import ChatRequest
 from aegis.semantic import OpenAICompatibleSemanticDetector
-from aegis.store import AuditDraft, BeginResult
+from aegis.store import AuditDraft, AuditSummary, BeginResult
 
 HMAC_KEY = "test-hmac-key-longer-than-thirty-two-bytes"
 DB_URL = "postgresql+psycopg://unused:unused@localhost/unused"
@@ -35,6 +35,25 @@ class MemoryStore:
         self.fail_model_intent = False
         self.fail_decision = False
         self.fail_finish = False
+
+    async def get_audit_summary(self, request_id: str, principal_id: str) -> AuditSummary | None:
+        event = self.events.get(request_id)
+        if event is None or event["principal_id"] != principal_id:
+            return None
+        return AuditSummary(
+            request_id=request_id,
+            conversation_id=event["conversation_id"],
+            status=event["status"],
+            policy_action=event["policy_action"],
+            actual_destination=event["actual_destination"],
+            simulation=event.get("simulation", False),
+            detected_categories=event["detected_categories"],
+            detection_status=event["detection_status"],
+            semantic_call_status=event.get("semantic_call_status"),
+            masking_status=event.get("masking_status"),
+            model_call_status=event.get("model_call_status"),
+            error_code=event.get("error_code"),
+        )
 
     async def record_rejection(self, draft: AuditDraft) -> None:
         self.events[draft.request_id] = {

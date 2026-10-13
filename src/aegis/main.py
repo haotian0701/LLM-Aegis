@@ -10,6 +10,7 @@ import re
 import secrets
 import time
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from datetime import UTC, datetime
 from hashlib import sha256
 from importlib.resources import files
@@ -47,6 +48,7 @@ from aegis.semantic import OpenAICompatibleSemanticDetector, SemanticDetector
 from aegis.store import AuditDraft, PostgresRequestStore, RequestStore
 
 CONVERSATION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+REQUEST_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
 MAX_BODY_BYTES = 128 * 1024
 MAX_TEXT_BYTES = 32 * 1024
 DEMO_PRINCIPAL = "__aegis_demo_browser__"
@@ -234,6 +236,32 @@ def create_app(
                 },
                 headers=demo_headers,
             )
+
+        @app.get("/demo/audit/{request_id}", include_in_schema=False)
+        async def demo_audit(request: Request, request_id: str) -> JSONResponse:
+            if not _local_demo_request(request):
+                return JSONResponse({"detail": "Not found"}, status_code=404, headers=demo_headers)
+            authorization = request.headers.get("authorization")
+            if (
+                authorization is None
+                or not authorization.startswith("Bearer ")
+                or demo_token is None
+                or not hmac.compare_digest(authorization[len("Bearer ") :], demo_token)
+            ):
+                return JSONResponse(
+                    {"detail": "Unauthorized"}, status_code=401, headers=demo_headers
+                )
+            if REQUEST_ID_PATTERN.fullmatch(request_id) is None:
+                return JSONResponse({"detail": "Not found"}, status_code=404, headers=demo_headers)
+            try:
+                summary = await store.get_audit_summary(request_id, DEMO_PRINCIPAL)
+            except Exception:
+                return JSONResponse(
+                    {"detail": "Audit unavailable"}, status_code=503, headers=demo_headers
+                )
+            if summary is None:
+                return JSONResponse({"detail": "Not found"}, status_code=404, headers=demo_headers)
+            return JSONResponse(asdict(summary), headers=demo_headers)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
