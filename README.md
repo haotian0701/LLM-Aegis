@@ -1,6 +1,6 @@
 # Aegis Gateway
 
-Stage 2 implements a text-only Chat Completions gateway with local rule detection, English CPU NER, policy decisions, conversation sensitivity, and PostgreSQL audit records. It does not yet send requests to a cloud model or perform masking. Demo mode can use an external OpenAI-compatible service **only for semantic classification**; that service receives the original text, so use synthetic data only.
+Stage 3 adds persistent conversation ownership, sensitive-state auditing, and explicit administration to the text-only gateway. It does not yet send requests to a cloud model or perform masking. Demo mode can use an external OpenAI-compatible service **only for semantic classification**; that service receives the original text, so use synthetic data only.
 
 ## Run locally (PowerShell)
 
@@ -43,9 +43,29 @@ Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:8000/v1/chat/completio
 
 The response is `403 POLICY_BLOCKED`; PowerShell may surface it as a web exception. Successful or failed valid requests return `X-Aegis-Conversation-Id`. Send it explicitly on later requests to reuse a conversation; omitting it starts a new one.
 
+## Conversation ownership and administration
+
+Only one request for a given API principal and conversation ID can be active at a time. Another request receives `409 CONVERSATION_BUSY`, with both request and conversation ID headers; retry with the same conversation ID after the first request finishes. It is audited and does not reach detection or a model. Different principals can use the same text ID independently.
+
+Sensitive state never expires or downgrades automatically. An operator can close a conversation from the host after its current request finishes:
+
+```powershell
+.\.venv\Scripts\python -m aegis.admin close-conversation --principal-id demo-client --conversation-id <id> --actor <operator-id>
+```
+
+The old ID then returns `410 CONVERSATION_CLOSED` and cannot be reopened; the client must use a new ID. Closing retains prior audit records and writes an administration event. There is no public administration HTTP endpoint.
+
+If a process dies or an audit write cannot finish, its conversation may remain occupied. After confirming the original process is stopped, the operator can mark the exact pending request abandoned and release its claim:
+
+```powershell
+.\.venv\Scripts\python -m aegis.admin recover-request --principal-id demo-client --conversation-id <id> --request-id <32-character-request-id> --actor <operator-id> --confirm-stopped
+```
+
+Recovery does not clear sensitive state. If the abandoned request has no committed policy decision, recovery conservatively marks the conversation sensitive. It records `REQUEST_ABANDONED` and an administration event. A cancelled request with no committed decision is handled the same way before its claim is released. Neither claims nor sensitive state have an automatic expiry. Both commands use `AEGIS_DATABASE_URL` and must run on the host with database access.
+
 ## Current decisions
 
-| Decision | Stage 2 behavior |
+| Decision | Current behavior |
 | --- | --- |
 | `BLOCK` | `403 POLICY_BLOCKED`; no semantic or model call when local rules already determine the block. |
 | `LOCAL` | Demo calls the fixed Mock response; strict returns `503 LOCAL_UNAVAILABLE` without a trusted local provider. |

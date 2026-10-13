@@ -1,7 +1,8 @@
-"""Aegis HTTP gateway with stage 2 fail-closed detection and policy."""
+"""Aegis HTTP gateway with fail-closed detection and conversation coordination."""
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import re
@@ -144,7 +145,7 @@ def create_app(
         if engine is not None:
             await engine.dispose()
 
-    app = FastAPI(title="Aegis Gateway", version="0.2.0", lifespan=lifespan)
+    app = FastAPI(title="Aegis Gateway", version="0.3.0", lifespan=lifespan)
     app.state.settings = settings
     app.state.store = store
     app.state.provider = provider
@@ -206,7 +207,7 @@ def create_app(
             return await reject(
                 400,
                 "UNSUPPORTED_FEATURE",
-                "Generation parameters are not supported by the stage 2 provider.",
+                "Generation parameters are not supported by the current provider.",
                 principal_id,
             )
         supplied_id = http_request.headers.get("x-aegis-conversation-id")
@@ -226,7 +227,7 @@ def create_app(
             prompt_hmac=_prompt_hmac(chat_request, settings.hmac_key),
         )
         try:
-            was_sensitive = await store.begin_request(draft)
+            begin = await store.begin_request(draft)
         except Exception:
             return _error(
                 503,
@@ -235,230 +236,278 @@ def create_app(
                 request_id,
                 conversation_id,
             )
+        if begin.status == "BUSY":
+            return _error(
+                409,
+                "CONVERSATION_BUSY",
+                "Conversation has an active request; retry later.",
+                request_id,
+                conversation_id,
+            )
+        if begin.status == "CLOSED":
+            return _error(
+                410,
+                "CONVERSATION_CLOSED",
+                "Conversation is closed; use a new conversation ID.",
+                request_id,
+                conversation_id,
+            )
+        assert begin.was_sensitive is not None
+        was_sensitive = begin.was_sensitive
 
-        async def finish_error(
-            code: str,
-            message: str,
-            *,
-            detection_status: str,
-            semantic_call_status: str | None = None,
-        ) -> JSONResponse:
+        async def process_claimed() -> JSONResponse:
+            async def finish_error(
+                code: str,
+                message: str,
+                *,
+                detection_status: str,
+                semantic_call_status: str | None = None,
+            ) -> JSONResponse:
+                try:
+                    await store.finish_dispatch(
+                        request_id,
+                        status="FAILED",
+                        error_code=code,
+                        duration_ms=max(0, round((time.perf_counter() - started) * 1000)),
+                        detection_status=detection_status,
+                        semantic_call_status=semantic_call_status,
+                        detected_categories=sorted(
+                            {finding.category.value for finding in findings}
+                        ),
+                        detector_durations_ms=durations,
+                    )
+                except Exception:
+                    return _error(
+                        503,
+                        "AUDIT_UNAVAILABLE",
+                        "Audit storage is unavailable.",
+                        request_id,
+                        conversation_id,
+                    )
+                return _error(503, code, message, request_id, conversation_id)
+
+            findings = []
+            durations: dict[str, int] = {}
+            local_failure = False
+            locally_blocked = False
+            try:
+                detector_started = time.perf_counter()
+                findings.extend(rule_detector.detect(fragments))
+                durations["rules"] = max(0, round((time.perf_counter() - detector_started) * 1000))
+                locally_blocked = (
+                    policy.decide(
+                        (finding.category for finding in findings), was_sensitive=was_sensitive
+                    )
+                    == Action.BLOCK
+                )
+                if not locally_blocked:
+                    detector_started = time.perf_counter()
+                    findings.extend(await ner_detector.detect(fragments))
+                    durations["ner"] = max(
+                        0, round((time.perf_counter() - detector_started) * 1000)
+                    )
+            except Exception:
+                local_failure = True
+            findings = unique_findings(findings)
+            categories = {finding.category for finding in findings}
+            if not local_failure:
+                try:
+                    locally_blocked = (
+                        policy.decide(categories, was_sensitive=was_sensitive) == Action.BLOCK
+                    )
+                except Exception:
+                    local_failure = True
+
+            if local_failure and settings.run_mode == "demo":
+                return await finish_error(
+                    "SECURITY_UNAVAILABLE",
+                    "Security detection is unavailable.",
+                    detection_status="FAILED",
+                )
+
+            semantic_succeeded = False
+            if (
+                not local_failure
+                and not locally_blocked
+                and not was_sensitive
+                and settings.run_mode == "demo"
+                and fragments
+            ):
+                if semantic_detector is None:
+                    return await finish_error(
+                        "SECURITY_UNAVAILABLE",
+                        "Semantic detection is unavailable.",
+                        detection_status="UNAVAILABLE",
+                    )
+                try:
+                    await store.record_external_intent(
+                        request_id,
+                        provider_name=semantic_detector.name,
+                        model=semantic_detector.model,
+                    )
+                except Exception:
+                    return _error(
+                        503,
+                        "AUDIT_UNAVAILABLE",
+                        "Audit storage is unavailable.",
+                        request_id,
+                        conversation_id,
+                    )
+                detector_started = time.perf_counter()
+                try:
+                    findings.extend(await semantic_detector.detect(fragments))
+                    durations["semantic"] = max(
+                        0, round((time.perf_counter() - detector_started) * 1000)
+                    )
+                    semantic_succeeded = True
+                except Exception:
+                    durations["semantic"] = max(
+                        0, round((time.perf_counter() - detector_started) * 1000)
+                    )
+                    return await finish_error(
+                        "SECURITY_UNAVAILABLE",
+                        "Semantic detection failed.",
+                        detection_status="FAILED",
+                        semantic_call_status="FAILED",
+                    )
+
+            findings = unique_findings(findings)
+            categories = {finding.category for finding in findings}
+            try:
+                action = policy.decide(categories, was_sensitive=was_sensitive)
+            except Exception:
+                if settings.run_mode == "demo":
+                    return await finish_error(
+                        "SECURITY_UNAVAILABLE",
+                        "Policy evaluation failed.",
+                        detection_status="FAILED",
+                    )
+                action = Action.LOCAL
+                local_failure = True
+            if (local_failure or settings.run_mode == "strict") and action != Action.BLOCK:
+                action = Action.LOCAL
+            detection_status = (
+                "DEGRADED" if local_failure or settings.run_mode == "strict" else "COMPLETE"
+            )
+            try:
+                action = await store.record_decision(
+                    request_id,
+                    principal_id=principal_id,
+                    conversation_id=conversation_id,
+                    action=action,
+                    categories=sorted(category.value for category in categories),
+                    detection_status=detection_status,
+                    detector_durations_ms=durations,
+                    upgrade_sensitive=bool(categories & UPGRADE_CATEGORIES),
+                    local_destination=provider.destination if provider is not None else "NONE",
+                    local_provider_name=provider.name if provider is not None else None,
+                    local_model=settings.model_aliases[chat_request.model]
+                    if provider is not None
+                    else None,
+                    local_simulation=provider.simulation if provider is not None else False,
+                    semantic_succeeded=semantic_succeeded,
+                )
+            except Exception:
+                return _error(
+                    503,
+                    "AUDIT_UNAVAILABLE",
+                    "Audit storage is unavailable.",
+                    request_id,
+                    conversation_id,
+                )
+
+            status = "SUCCEEDED"
+            error_code: str | None = None
+            response: JSONResponse
+            if action == Action.BLOCK:
+                status = "BLOCKED"
+                error_code = "POLICY_BLOCKED"
+                response = _error(
+                    403, error_code, "Request blocked by policy.", request_id, conversation_id
+                )
+            elif action in {Action.CLOUD, Action.MASK_CLOUD}:
+                status = "FAILED"
+                error_code = "ROUTE_UNAVAILABLE"
+                response = _error(
+                    503,
+                    error_code,
+                    "Selected route is not available yet.",
+                    request_id,
+                    conversation_id,
+                )
+            elif provider is None:
+                status = "FAILED"
+                error_code = "LOCAL_UNAVAILABLE"
+                response = _error(
+                    503,
+                    error_code,
+                    "No trusted local provider is configured.",
+                    request_id,
+                    conversation_id,
+                )
+            else:
+                try:
+                    result = await provider.complete(chat_request)
+                    completion = ChatCompletionResponse(
+                        id=f"chatcmpl-{request_id}",
+                        created=int(datetime.now(UTC).timestamp()),
+                        model=chat_request.model,
+                        choices=[
+                            ChatCompletionChoice(
+                                message=ChatCompletionMessage(content=result.content)
+                            )
+                        ],
+                    )
+                    response = JSONResponse(
+                        content=completion.model_dump(),
+                        headers={
+                            "X-Aegis-Request-Id": request_id,
+                            "X-Aegis-Conversation-Id": conversation_id,
+                        },
+                    )
+                except TimeoutError:
+                    status = "FAILED"
+                    error_code = "PROVIDER_TIMEOUT"
+                    response = _error(
+                        504, error_code, "Local provider timed out.", request_id, conversation_id
+                    )
+                except Exception:
+                    status = "FAILED"
+                    error_code = "PROVIDER_ERROR"
+                    response = _error(
+                        502, error_code, "Local provider failed.", request_id, conversation_id
+                    )
+
+            try:
+                await store.finish_dispatch(
+                    request_id,
+                    status=status,
+                    error_code=error_code,
+                    duration_ms=max(0, round((time.perf_counter() - started) * 1000)),
+                )
+            except Exception:
+                return _error(
+                    503,
+                    "AUDIT_UNAVAILABLE",
+                    "Audit storage is unavailable.",
+                    request_id,
+                    conversation_id,
+                )
+            return response
+
+        try:
+            return await process_claimed()
+        except asyncio.CancelledError:
             try:
                 await store.finish_dispatch(
                     request_id,
                     status="FAILED",
-                    error_code=code,
+                    error_code="REQUEST_CANCELLED",
                     duration_ms=max(0, round((time.perf_counter() - started) * 1000)),
-                    detection_status=detection_status,
-                    semantic_call_status=semantic_call_status,
-                    detected_categories=sorted({finding.category.value for finding in findings}),
-                    detector_durations_ms=durations,
-                )
-            except Exception:
-                return _error(
-                    503,
-                    "AUDIT_UNAVAILABLE",
-                    "Audit storage is unavailable.",
-                    request_id,
-                    conversation_id,
-                )
-            return _error(503, code, message, request_id, conversation_id)
-
-        findings = []
-        durations: dict[str, int] = {}
-        local_failure = False
-        locally_blocked = False
-        try:
-            detector_started = time.perf_counter()
-            findings.extend(rule_detector.detect(fragments))
-            durations["rules"] = max(0, round((time.perf_counter() - detector_started) * 1000))
-            locally_blocked = (
-                policy.decide(
-                    (finding.category for finding in findings), was_sensitive=was_sensitive
-                )
-                == Action.BLOCK
-            )
-            if not locally_blocked:
-                detector_started = time.perf_counter()
-                findings.extend(await ner_detector.detect(fragments))
-                durations["ner"] = max(0, round((time.perf_counter() - detector_started) * 1000))
-        except Exception:
-            local_failure = True
-        findings = unique_findings(findings)
-        categories = {finding.category for finding in findings}
-        if not local_failure:
-            try:
-                locally_blocked = (
-                    policy.decide(categories, was_sensitive=was_sensitive) == Action.BLOCK
-                )
-            except Exception:
-                local_failure = True
-
-        if local_failure and settings.run_mode == "demo":
-            return await finish_error(
-                "SECURITY_UNAVAILABLE",
-                "Security detection is unavailable.",
-                detection_status="FAILED",
-            )
-
-        semantic_succeeded = False
-        if (
-            not local_failure
-            and not locally_blocked
-            and not was_sensitive
-            and settings.run_mode == "demo"
-            and fragments
-        ):
-            if semantic_detector is None:
-                return await finish_error(
-                    "SECURITY_UNAVAILABLE",
-                    "Semantic detection is unavailable.",
-                    detection_status="UNAVAILABLE",
-                )
-            try:
-                await store.record_external_intent(
-                    request_id, provider_name=semantic_detector.name, model=semantic_detector.model
-                )
-            except Exception:
-                return _error(
-                    503,
-                    "AUDIT_UNAVAILABLE",
-                    "Audit storage is unavailable.",
-                    request_id,
-                    conversation_id,
-                )
-            detector_started = time.perf_counter()
-            try:
-                findings.extend(await semantic_detector.detect(fragments))
-                durations["semantic"] = max(
-                    0, round((time.perf_counter() - detector_started) * 1000)
-                )
-                semantic_succeeded = True
-            except Exception:
-                durations["semantic"] = max(
-                    0, round((time.perf_counter() - detector_started) * 1000)
-                )
-                return await finish_error(
-                    "SECURITY_UNAVAILABLE",
-                    "Semantic detection failed.",
                     detection_status="FAILED",
-                    semantic_call_status="FAILED",
-                )
-
-        findings = unique_findings(findings)
-        categories = {finding.category for finding in findings}
-        try:
-            action = policy.decide(categories, was_sensitive=was_sensitive)
-        except Exception:
-            if settings.run_mode == "demo":
-                return await finish_error(
-                    "SECURITY_UNAVAILABLE", "Policy evaluation failed.", detection_status="FAILED"
-                )
-            action = Action.LOCAL
-            local_failure = True
-        if (local_failure or settings.run_mode == "strict") and action != Action.BLOCK:
-            action = Action.LOCAL
-        detection_status = (
-            "DEGRADED" if local_failure or settings.run_mode == "strict" else "COMPLETE"
-        )
-        try:
-            action = await store.record_decision(
-                request_id,
-                principal_id=principal_id,
-                conversation_id=conversation_id,
-                action=action,
-                categories=sorted(category.value for category in categories),
-                detection_status=detection_status,
-                detector_durations_ms=durations,
-                upgrade_sensitive=bool(categories & UPGRADE_CATEGORIES),
-                local_destination=provider.destination if provider is not None else "NONE",
-                local_provider_name=provider.name if provider is not None else None,
-                local_model=settings.model_aliases[chat_request.model]
-                if provider is not None
-                else None,
-                local_simulation=provider.simulation if provider is not None else False,
-                semantic_succeeded=semantic_succeeded,
-            )
-        except Exception:
-            return _error(
-                503,
-                "AUDIT_UNAVAILABLE",
-                "Audit storage is unavailable.",
-                request_id,
-                conversation_id,
-            )
-
-        status = "SUCCEEDED"
-        error_code: str | None = None
-        response: JSONResponse
-        if action == Action.BLOCK:
-            status = "BLOCKED"
-            error_code = "POLICY_BLOCKED"
-            response = _error(
-                403, error_code, "Request blocked by policy.", request_id, conversation_id
-            )
-        elif action in {Action.CLOUD, Action.MASK_CLOUD}:
-            status = "FAILED"
-            error_code = "ROUTE_UNAVAILABLE"
-            response = _error(
-                503, error_code, "Selected route is not available yet.", request_id, conversation_id
-            )
-        elif provider is None:
-            status = "FAILED"
-            error_code = "LOCAL_UNAVAILABLE"
-            response = _error(
-                503,
-                error_code,
-                "No trusted local provider is configured.",
-                request_id,
-                conversation_id,
-            )
-        else:
-            try:
-                result = await provider.complete(chat_request)
-                completion = ChatCompletionResponse(
-                    id=f"chatcmpl-{request_id}",
-                    created=int(datetime.now(UTC).timestamp()),
-                    model=chat_request.model,
-                    choices=[
-                        ChatCompletionChoice(message=ChatCompletionMessage(content=result.content))
-                    ],
-                )
-                response = JSONResponse(
-                    content=completion.model_dump(),
-                    headers={
-                        "X-Aegis-Request-Id": request_id,
-                        "X-Aegis-Conversation-Id": conversation_id,
-                    },
-                )
-            except TimeoutError:
-                status = "FAILED"
-                error_code = "PROVIDER_TIMEOUT"
-                response = _error(
-                    504, error_code, "Local provider timed out.", request_id, conversation_id
                 )
             except Exception:
-                status = "FAILED"
-                error_code = "PROVIDER_ERROR"
-                response = _error(
-                    502, error_code, "Local provider failed.", request_id, conversation_id
-                )
-
-        try:
-            await store.finish_dispatch(
-                request_id,
-                status=status,
-                error_code=error_code,
-                duration_ms=max(0, round((time.perf_counter() - started) * 1000)),
-            )
-        except Exception:
-            return _error(
-                503,
-                "AUDIT_UNAVAILABLE",
-                "Audit storage is unavailable.",
-                request_id,
-                conversation_id,
-            )
-        return response
+                pass  # An uncertain database result remains claimed for explicit recovery.
+            raise
 
     return app

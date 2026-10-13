@@ -1,4 +1,4 @@
-"""Stage 2 HTTP behavior and fail-closed routing tests."""
+"""HTTP behavior, fail-closed routing and conversation state tests."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from aegis.policy import Action, Category, PolicyEngine
 from aegis.provider import ProviderResult
 from aegis.schemas import ChatRequest
 from aegis.semantic import OpenAICompatibleSemanticDetector
-from aegis.store import AuditDraft
+from aegis.store import AuditDraft, BeginResult
 
 HMAC_KEY = "test-hmac-key-longer-than-thirty-two-bytes"
 DB_URL = "postgresql+psycopg://unused:unused@localhost/unused"
@@ -27,6 +27,9 @@ class MemoryStore:
     def __init__(self) -> None:
         self.events: dict[str, dict[str, Any]] = {}
         self.conversations: dict[tuple[str, str], bool] = {}
+        self.active: dict[tuple[str, str], str] = {}
+        self.closed: set[tuple[str, str]] = set()
+        self.versions: dict[tuple[str, str], int] = {}
         self.fail_begin = False
         self.fail_intent = False
         self.fail_decision = False
@@ -41,13 +44,15 @@ class MemoryStore:
             "detection_status": "NOT_RUN",
         }
 
-    async def begin_request(self, draft: AuditDraft) -> bool:
+    async def begin_request(self, draft: AuditDraft) -> BeginResult:
         if self.fail_begin:
             raise RuntimeError("database unavailable")
         assert draft.principal_id is not None
         assert draft.conversation_id is not None
         key = (draft.principal_id, draft.conversation_id)
         self.conversations.setdefault(key, False)
+        self.versions.setdefault(key, 0)
+        state = "SENSITIVE" if self.conversations[key] else "NORMAL"
         self.events[draft.request_id] = {
             **vars(draft),
             "policy_action": None,
@@ -55,14 +60,37 @@ class MemoryStore:
             "detected_categories": [],
             "detection_status": "PENDING",
             "semantic_call_status": None,
+            "conversation_state_before": state,
+            "conversation_state_after": None,
+            "conversation_state_version": self.versions[key],
         }
-        return self.conversations[key]
+        if key in self.closed:
+            self.events[draft.request_id].update(
+                status="REJECTED",
+                error_code="CONVERSATION_CLOSED",
+                conversation_state_before="CLOSED",
+                conversation_state_after="CLOSED",
+                detection_status="NOT_RUN",
+            )
+            return BeginResult("CLOSED")
+        if key in self.active:
+            self.events[draft.request_id].update(
+                status="REJECTED",
+                error_code="CONVERSATION_BUSY",
+                conversation_state_after=state,
+                detection_status="NOT_RUN",
+            )
+            return BeginResult("BUSY")
+        self.active[key] = draft.request_id
+        return BeginResult("CLAIMED", self.conversations[key])
 
     async def record_external_intent(
         self, request_id: str, *, provider_name: str, model: str
     ) -> None:
         if self.fail_intent:
             raise RuntimeError("database unavailable")
+        event = self.events[request_id]
+        assert self.active[(event["principal_id"], event["conversation_id"])] == request_id
         self.events[request_id].update(
             semantic_destination="EXTERNAL",
             semantic_provider_name=provider_name,
@@ -90,8 +118,10 @@ class MemoryStore:
         if self.fail_decision:
             raise RuntimeError("database unavailable")
         key = (principal_id, conversation_id)
-        if upgrade_sensitive:
+        assert self.active[key] == request_id
+        if upgrade_sensitive and not self.conversations[key]:
             self.conversations[key] = True
+            self.versions[key] += 1
         if self.conversations[key] and action in {Action.CLOUD, Action.MASK_CLOUD}:
             action = Action.LOCAL
         self.events[request_id].update(
@@ -104,6 +134,8 @@ class MemoryStore:
             detected_categories=categories,
             detection_status=detection_status,
             detector_durations_ms=detector_durations_ms,
+            conversation_state_after="SENSITIVE" if self.conversations[key] else "NORMAL",
+            conversation_state_version=self.versions[key],
         )
         if semantic_succeeded:
             assert self.events[request_id]["semantic_call_status"] == "INTENDED"
@@ -125,7 +157,11 @@ class MemoryStore:
         if self.fail_finish:
             raise RuntimeError("database unavailable")
         event = self.events[request_id]
+        key = (event["principal_id"], event["conversation_id"])
+        assert self.active[key] == request_id
         event.update(status=status, error_code=error_code, total_duration_ms=duration_ms)
+        if event["conversation_state_after"] is None:
+            event["conversation_state_after"] = event["conversation_state_before"]
         if detection_status is not None:
             event["detection_status"] = detection_status
         if semantic_call_status is not None:
@@ -134,6 +170,7 @@ class MemoryStore:
             event["detected_categories"] = detected_categories
         if detector_durations_ms is not None:
             event["detector_durations_ms"] = detector_durations_ms
+        del self.active[key]
 
 
 class RecordingProvider:
@@ -331,6 +368,10 @@ async def test_rule_block_skips_external_detector_and_model(secret_text: str) ->
     assert event["status"] == "BLOCKED"
     assert event["blocked"] is True
     assert event["actual_destination"] == "NONE"
+    assert (event["conversation_state_before"], event["conversation_state_after"]) == (
+        "NORMAL",
+        "SENSITIVE",
+    )
 
 
 @pytest.mark.asyncio
