@@ -88,3 +88,11 @@ class OpenAICompatibleCloudProvider:
             raise TimeoutError("cloud provider timed out") from exc
         except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError) as exc:
             raise RuntimeError("cloud provider unavailable or invalid") from exc
+
+
+class SimulatedLocalProvider(OpenAICompatibleCloudProvider):
+    """Explicit demo route that sends LOCAL decisions to an external model."""
+
+    name = "simulated-local-openai-compatible"
+    destination = "EXTERNAL"
+    simulation = True

@@ -216,7 +216,11 @@ class PostgresRequestStore:
     ) -> None:
         async with self._sessions() as session, session.begin():
             _, event = await self._owned_event(session, request_id)
-            if event.policy_action not in {Action.CLOUD.value, Action.MASK_CLOUD.value}:
+            simulated_local = event.policy_action == Action.LOCAL.value and event.simulation
+            if (
+                event.policy_action not in {Action.CLOUD.value, Action.MASK_CLOUD.value}
+                and not simulated_local
+            ):
                 raise RuntimeError("external model route was not selected")
             if event.model_call_status is not None or masked != (
                 event.policy_action == "MASK_CLOUD"

@@ -108,7 +108,9 @@ class MemoryStore:
             raise RuntimeError("database unavailable")
         event = self.events[request_id]
         assert self.active[(event["principal_id"], event["conversation_id"])] == request_id
-        assert event["policy_action"] in {"CLOUD", "MASK_CLOUD"}
+        assert event["policy_action"] in {"CLOUD", "MASK_CLOUD"} or (
+            event["policy_action"] == "LOCAL" and event["simulation"]
+        )
         assert masked == (event["policy_action"] == "MASK_CLOUD")
         event.update(
             actual_destination="EXTERNAL",

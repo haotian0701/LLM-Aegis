@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import ipaddress
 import json
 import re
+import secrets
 import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from hashlib import sha256
+from importlib.resources import files
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -28,7 +31,12 @@ from aegis.detection import (
 )
 from aegis.masking import MaskingError, mask_request
 from aegis.policy import UPGRADE_CATEGORIES, Action, PolicyEngine
-from aegis.provider import MockLocalProvider, ModelProvider, OpenAICompatibleCloudProvider
+from aegis.provider import (
+    MockLocalProvider,
+    ModelProvider,
+    OpenAICompatibleCloudProvider,
+    SimulatedLocalProvider,
+)
 from aegis.schemas import (
     ChatCompletionChoice,
     ChatCompletionMessage,
@@ -41,6 +49,25 @@ from aegis.store import AuditDraft, PostgresRequestStore, RequestStore
 CONVERSATION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 MAX_BODY_BYTES = 128 * 1024
 MAX_TEXT_BYTES = 32 * 1024
+DEMO_PRINCIPAL = "__aegis_demo_browser__"
+
+
+def _local_demo_request(request: Request) -> bool:
+    if request.client is None or request.url.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        return False
+    try:
+        return ipaddress.ip_address(request.client.host).is_loopback
+    except ValueError:
+        return False
+
+
+def _route_headers(
+    response: JSONResponse, action: Action, destination: str, simulation: bool
+) -> JSONResponse:
+    response.headers["X-Aegis-Policy-Action"] = action.value
+    response.headers["X-Aegis-Actual-Destination"] = destination
+    response.headers["X-Aegis-Simulation"] = "true" if simulation else "false"
+    return response
 
 
 def _error(
@@ -116,14 +143,23 @@ def create_app(
     """Build the gateway; tests may inject detectors, storage and providers."""
     settings = settings or Settings.from_env()
     if settings.run_mode == "strict":
-        if provider is not None and provider.simulation:
-            raise ValueError("strict mode cannot use a simulated provider")
+        if provider is not None and (provider.simulation or provider.destination == "EXTERNAL"):
+            raise ValueError("strict mode cannot use an external or simulated provider")
         if semantic_detector is not None and semantic_detector.external:
             raise ValueError("strict mode cannot use an external semantic detector")
         if cloud_provider is not None:
             raise ValueError("strict mode cannot load an external cloud provider")
     elif provider is None:
-        provider = MockLocalProvider()
+        if settings.demo_provider == "simulated_local":
+            assert settings.cloud_base_url is not None
+            assert settings.cloud_api_key is not None
+            provider = SimulatedLocalProvider(
+                base_url=settings.cloud_base_url,
+                api_key=settings.cloud_api_key,
+                model_aliases=settings.model_aliases,
+            )
+        else:
+            provider = MockLocalProvider()
 
     policy = policy or PolicyEngine.load(settings.policy_path)
     rule_detector = rule_detector or RuleDetector()
@@ -156,12 +192,48 @@ def create_app(
         if engine is not None:
             await engine.dispose()
 
-    app = FastAPI(title="Aegis Gateway", version="0.4.0", lifespan=lifespan)
+    app = FastAPI(title="Aegis Gateway", version="0.5.0", lifespan=lifespan)
     app.state.settings = settings
     app.state.store = store
     app.state.provider = provider
     app.state.cloud_provider = cloud_provider
     app.state.policy = policy
+
+    demo_token: str | None = None
+    if settings.run_mode == "demo":
+        if DEMO_PRINCIPAL in settings.api_keys:
+            raise ValueError("reserved demo browser principal is configured")
+        demo_token = secrets.token_urlsafe(32)
+        demo_page = files("aegis").joinpath("demo.html").read_text(encoding="utf-8")
+        demo_headers = {
+            "Cache-Control": "no-store",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": (
+                "default-src 'none'; script-src 'unsafe-inline'; "
+                "style-src 'unsafe-inline'; connect-src 'self'; "
+                "base-uri 'none'; form-action 'none'"
+            ),
+        }
+
+        @app.get("/", include_in_schema=False)
+        async def demo_home(request: Request) -> HTMLResponse:
+            if not _local_demo_request(request):
+                return HTMLResponse("Not found", status_code=404)
+            return HTMLResponse(demo_page, headers=demo_headers)
+
+        @app.get("/demo/bootstrap", include_in_schema=False)
+        async def demo_bootstrap(request: Request) -> JSONResponse:
+            if not _local_demo_request(request):
+                return JSONResponse({"detail": "Not found"}, status_code=404)
+            return JSONResponse(
+                {
+                    "token": demo_token,
+                    "models": list(settings.model_aliases),
+                    "local_mode": settings.demo_provider,
+                },
+                headers=demo_headers,
+            )
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -182,6 +254,11 @@ def create_app(
             return _error(status_code, code, message, request_id)
 
         principal_id = _authenticate(http_request.headers.get("authorization"), settings.api_keys)
+        if principal_id is None and demo_token is not None and _local_demo_request(http_request):
+            header = http_request.headers.get("authorization")
+            if header is not None and header.startswith("Bearer "):
+                if hmac.compare_digest(header[len("Bearer ") :], demo_token):
+                    principal_id = DEMO_PRINCIPAL
         if principal_id is None:
             return await reject(401, "UNAUTHORIZED", "Invalid API token.", None)
         if (
@@ -397,7 +474,11 @@ def create_app(
                     detection_status=detection_status,
                     detector_durations_ms=durations,
                     upgrade_sensitive=bool(categories & UPGRADE_CATEGORIES),
-                    local_destination=provider.destination if provider is not None else "NONE",
+                    local_destination=(
+                        provider.destination
+                        if provider is not None and provider.destination != "EXTERNAL"
+                        else "NONE"
+                    ),
                     local_provider_name=provider.name if provider is not None else None,
                     local_model=settings.model_aliases[chat_request.model]
                     if provider is not None
@@ -419,6 +500,19 @@ def create_app(
             model_call_status: str | None = None
             masking_status: str | None = None
             response: JSONResponse | None = None
+            external_local = (
+                action == Action.LOCAL
+                and provider is not None
+                and provider.destination == "EXTERNAL"
+            )
+            route_destination = (
+                provider.destination
+                if action == Action.LOCAL and provider is not None and not external_local
+                else "NONE"
+            )
+            route_simulation = (
+                action == Action.LOCAL and provider is not None and provider.simulation
+            )
             if action == Action.BLOCK:
                 status = "BLOCKED"
                 error_code = "POLICY_BLOCKED"
@@ -463,13 +557,19 @@ def create_app(
                                 masked=masked_request is not None,
                             )
                         except Exception:
-                            return _error(
-                                503,
-                                "AUDIT_UNAVAILABLE",
-                                "Audit storage is unavailable.",
-                                request_id,
-                                conversation_id,
+                            return _route_headers(
+                                _error(
+                                    503,
+                                    "AUDIT_UNAVAILABLE",
+                                    "Audit storage is unavailable.",
+                                    request_id,
+                                    conversation_id,
+                                ),
+                                action,
+                                route_destination,
+                                route_simulation,
                             )
+                        route_destination = "EXTERNAL"
                         try:
                             result = await cloud_provider.complete(outbound)
                             model_call_status = "SUCCEEDED"
@@ -528,7 +628,7 @@ def create_app(
                                 request_id,
                                 conversation_id,
                             )
-            elif any(
+            elif not external_local and any(
                 value is not None
                 for value in (
                     chat_request.temperature,
@@ -556,8 +656,34 @@ def create_app(
                     conversation_id,
                 )
             else:
+                if external_local:
+                    assert provider is not None
+                    try:
+                        await store.record_model_intent(
+                            request_id,
+                            provider_name=provider.name,
+                            model=settings.model_aliases[chat_request.model],
+                            masked=False,
+                        )
+                    except Exception:
+                        return _route_headers(
+                            _error(
+                                503,
+                                "AUDIT_UNAVAILABLE",
+                                "Audit storage is unavailable.",
+                                request_id,
+                                conversation_id,
+                            ),
+                            action,
+                            route_destination,
+                            route_simulation,
+                        )
+                    route_destination = "EXTERNAL"
                 try:
+                    assert provider is not None
                     result = await provider.complete(chat_request)
+                    if external_local:
+                        model_call_status = "SUCCEEDED"
                     completion = ChatCompletionResponse(
                         id=f"chatcmpl-{request_id}",
                         created=int(datetime.now(UTC).timestamp()),
@@ -579,12 +705,16 @@ def create_app(
                 except TimeoutError:
                     status = "FAILED"
                     error_code = "PROVIDER_TIMEOUT"
+                    if external_local:
+                        model_call_status = "FAILED"
                     response = _error(
                         504, error_code, "Local provider timed out.", request_id, conversation_id
                     )
                 except Exception:
                     status = "FAILED"
                     error_code = "PROVIDER_ERROR"
+                    if external_local:
+                        model_call_status = "FAILED"
                     response = _error(
                         502, error_code, "Local provider failed.", request_id, conversation_id
                     )
@@ -600,14 +730,19 @@ def create_app(
                     masking_status=masking_status,
                 )
             except Exception:
-                return _error(
-                    503,
-                    "AUDIT_UNAVAILABLE",
-                    "Audit storage is unavailable.",
-                    request_id,
-                    conversation_id,
+                return _route_headers(
+                    _error(
+                        503,
+                        "AUDIT_UNAVAILABLE",
+                        "Audit storage is unavailable.",
+                        request_id,
+                        conversation_id,
+                    ),
+                    action,
+                    route_destination,
+                    route_simulation,
                 )
-            return response
+            return _route_headers(response, action, route_destination, route_simulation)
 
         try:
             return await process_claimed()

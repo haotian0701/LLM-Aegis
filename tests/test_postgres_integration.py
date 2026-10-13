@@ -15,7 +15,7 @@ from aegis.config import Settings
 from aegis.detection import Finding, TextFragment
 from aegis.main import create_app
 from aegis.models import AuditEvent, Conversation
-from aegis.provider import OpenAICompatibleCloudProvider
+from aegis.provider import OpenAICompatibleCloudProvider, SimulatedLocalProvider
 from aegis.semantic import OpenAICompatibleSemanticDetector
 
 TEST_DATABASE_URL = os.getenv("AEGIS_TEST_DATABASE_URL")
@@ -257,5 +257,101 @@ async def test_stage_four_cloud_masking_and_sensitive_state_persist() -> None:
             assert mask_audit.semantic_destination == "EXTERNAL"
             assert (local_audit.policy_action, later_audit.policy_action) == ("LOCAL", "LOCAL")
             assert all("synthetic@example.org" not in repr(event.__dict__) for event in audits)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.skipif(TEST_DATABASE_URL is None, reason="AEGIS_TEST_DATABASE_URL is not set")
+@pytest.mark.asyncio
+async def test_stage_five_simulated_local_intent_and_state_persist() -> None:
+    assert TEST_DATABASE_URL is not None
+    conversation_id = f"integration-simulated-{uuid4().hex}"
+    config = Settings(
+        database_url=TEST_DATABASE_URL,
+        api_keys={"integration-simulated": "simulated-client-token"},
+        hmac_key="integration-simulated-hmac-key-longer-than-32-bytes",
+        run_mode="demo",
+        demo_provider="simulated_local",
+        cloud_base_url="https://cloud.example/v1",
+        cloud_api_key="synthetic-cloud-key",
+        model_aliases={"aegis-demo": "synthetic-upstream-model"},
+    )
+    outbound: list[dict[str, object]] = []
+
+    def complete(request: httpx.Request) -> httpx.Response:
+        outbound.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "synthetic answer"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(complete)) as upstream:
+        local = SimulatedLocalProvider(
+            base_url=config.cloud_base_url or "",
+            api_key=config.cloud_api_key or "",
+            model_aliases=config.model_aliases,
+            client=upstream,
+        )
+        app = create_app(config, provider=local, ner_detector=EmptyNer())
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                headers = {
+                    "Authorization": "Bearer simulated-client-token",
+                    "X-Aegis-Conversation-Id": conversation_id,
+                }
+                blocked = await client.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "aegis-demo",
+                        "messages": [{"role": "user", "content": "api_key=abcdefghijklmnop12345"}],
+                    },
+                )
+                assert blocked.status_code == 403
+                followup = await client.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "aegis-demo",
+                        "messages": [{"role": "user", "content": "synthetic follow-up"}],
+                    },
+                )
+                assert followup.status_code == 200
+                assert followup.headers["x-aegis-policy-action"] == "LOCAL"
+                assert followup.headers["x-aegis-actual-destination"] == "EXTERNAL"
+                assert followup.headers["x-aegis-simulation"] == "true"
+
+    assert len(outbound) == 1
+    assert outbound[0]["messages"] == [{"role": "user", "content": "synthetic follow-up"}]
+    engine = create_async_engine(TEST_DATABASE_URL)
+    try:
+        async with async_sessionmaker(engine)() as session:
+            conversation = await session.get(
+                Conversation, ("integration-simulated", conversation_id)
+            )
+            audit = await session.get(AuditEvent, followup.headers["x-aegis-request-id"])
+            assert conversation is not None and conversation.sensitive
+            assert conversation.active_request_id is None
+            assert audit is not None
+            assert (audit.policy_action, audit.actual_destination, audit.simulation) == (
+                "LOCAL",
+                "EXTERNAL",
+                True,
+            )
+            assert (audit.provider_name, audit.provider_model, audit.model_call_status) == (
+                "simulated-local-openai-compatible",
+                "synthetic-upstream-model",
+                "SUCCEEDED",
+            )
+            assert "synthetic follow-up" not in repr(audit.__dict__)
     finally:
         await engine.dispose()

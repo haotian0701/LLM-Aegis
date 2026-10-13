@@ -1,6 +1,6 @@
 # Aegis Gateway
 
-Stage 4 adds a demo-only OpenAI-compatible cloud model route and request-scoped reversible masking. The external semantic classifier still receives the original supported message text **before masking**. Use synthetic data only.
+Stage 5 adds an explicit demo-only cloud simulation for `LOCAL` decisions and a loopback browser demo. A simulated `LOCAL` call sends the original message to an external model; it does not provide local isolation. The external semantic classifier also receives the original supported text **before masking**. Use synthetic data only.
 
 ## Run locally (PowerShell)
 
@@ -43,6 +43,12 @@ $env:AEGIS_MODEL_ALIASES_JSON = '{"aegis-demo":"replace-with-cloud-model-id"}'
 
 The model route receives raw text for `CLOUD` and masked text for `MASK_CLOUD`. The external semantic classifier receives the original text first in both cases. Mask mappings stay in request memory and are discarded after response handling; they are never sent to the cloud or stored in PostgreSQL. A response containing an unresolved request placeholder fails with `SECURITY_UNAVAILABLE`.
 
+To use the configured cloud model for `LOCAL` decisions, explicitly set `AEGIS_DEMO_PROVIDER=simulated_local` instead of `mock` and restart Aegis. It reuses `AEGIS_CLOUD_BASE_URL`, `AEGIS_CLOUD_API_KEY`, and `AEGIS_MODEL_ALIASES_JSON`; incomplete cloud configuration prevents startup. This route is identified as `simulated-local-openai-compatible` in the audit, with `policy_action=LOCAL`, `actual_destination=EXTERNAL`, and `simulation=true` after model egress intent commits. Security failures and model errors do not fall back to another route.
+
+In demo mode, open **http://127.0.0.1:8000/** on the same computer for the browser demo. The page automatically uses a temporary, process-scoped token for its own audit principal; it never displays the configured long-lived client token. The page and temporary token are only available on loopback and disappear in strict mode. It provides synthetic examples for `CLOUD`, `MASK_CLOUD`, `BLOCK`, and a follow-up `LOCAL` request using the blocked conversation ID. The follow-up deliberately omits the earlier text to demonstrate persisted security state. The page sends only the current message, so a separate client must pass history when model context is needed.
+
+Completed decisions include `X-Aegis-Policy-Action`, `X-Aegis-Actual-Destination`, and `X-Aegis-Simulation` response headers. Errors before a policy decision do not include these headers.
+
 Try a locally blocked synthetic request in a second PowerShell session:
 
 ```powershell
@@ -79,11 +85,11 @@ Recovery does not clear sensitive state. If the abandoned request has no committ
 | Decision | Current behavior |
 | --- | --- |
 | `BLOCK` | `403 POLICY_BLOCKED`; no semantic or model call when local rules already determine the block. |
-| `LOCAL` | Demo calls the fixed Mock response; strict returns `503 LOCAL_UNAVAILABLE` without a trusted local provider. |
+| `LOCAL` | Demo calls the selected Mock or explicit external simulated provider; strict returns `503 LOCAL_UNAVAILABLE` without a trusted local provider. |
 | `CLOUD` | Demo calls the configured cloud model after successful detection and audit; without cloud configuration, `503 ROUTE_UNAVAILABLE`. |
 | `MASK_CLOUD` | Demo masks located entities across all supported text fields, verifies the request, calls the cloud model, then restores response placeholders. Unsafe masking returns `503 SECURITY_UNAVAILABLE` without a model call. |
 
-The bundled YAML policy maps API keys and secrets to `BLOCK`, business secrets to `LOCAL`, and detected personal or network identifiers to `MASK_CLOUD`. A custom YAML file can be selected with `AEGIS_POLICY_PATH`; invalid or incomplete policies prevent startup. The request body limit is 128 KiB, and the extracted text limit is 32 KiB. Cloud requests forward `temperature`, `top_p`, and `max_tokens`; local Mock requests reject them. Strict mode continues to choose `LOCAL` because no trusted local semantic classifier is available.
+The bundled YAML policy maps API keys and secrets to `BLOCK`, business secrets to `LOCAL`, and detected personal or network identifiers to `MASK_CLOUD`. A custom YAML file can be selected with `AEGIS_POLICY_PATH`; invalid or incomplete policies prevent startup. The request body limit is 128 KiB, and the extracted text limit is 32 KiB. Cloud and simulated `LOCAL` requests forward `temperature`, `top_p`, and `max_tokens`; local Mock requests reject them. Strict mode continues to choose `LOCAL` because no trusted local semantic classifier is available.
 
 ## Check
 

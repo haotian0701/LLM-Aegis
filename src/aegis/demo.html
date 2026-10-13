@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Aegis 演示</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, "Microsoft YaHei", sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f3f5f8; color: #17212e; }
+    main { max-width: 900px; margin: 0 auto; padding: 36px 20px 72px; }
+    h1 { margin: 0 0 6px; font-size: 2rem; }
+    h2 { font-size: 1.1rem; margin: 0 0 14px; }
+    p { line-height: 1.55; }
+    .muted { color: #536070; }
+    .warning { border-left: 4px solid #d78312; background: #fff3dc; padding: 12px 16px; margin: 24px 0; }
+    .card { background: white; border: 1px solid #dce2e9; border-radius: 12px; padding: 20px; margin: 18px 0; box-shadow: 0 2px 8px #17212e0a; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
+    button { border: 0; border-radius: 8px; padding: 10px 14px; background: #1764c0; color: white; cursor: pointer; font: inherit; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    button.secondary { background: #e7edf5; color: #14345b; }
+    button.danger { background: #9e2f36; }
+    label { display: block; font-weight: 600; margin: 14px 0 6px; }
+    textarea, input, select { width: 100%; border: 1px solid #bdc8d5; border-radius: 8px; padding: 10px; font: inherit; background: white; color: inherit; }
+    textarea { min-height: 110px; resize: vertical; }
+    .actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 14px; }
+    .result { white-space: pre-wrap; overflow-wrap: anywhere; min-height: 48px; }
+    dl { display: grid; grid-template-columns: minmax(130px, 190px) 1fr; gap: 8px 12px; margin: 0; }
+    dt { color: #536070; } dd { margin: 0; overflow-wrap: anywhere; }
+    .tag { display: inline-block; border-radius: 6px; background: #e7edf5; padding: 3px 8px; font-weight: 700; }
+    .tag.external { background: #ffe5cc; color: #7d3900; }
+    @media (max-width: 540px) { dl { grid-template-columns: 1fr; } dd { margin-bottom: 7px; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Aegis 路由演示</h1>
+  <p class="muted">用合成文本查看安全决策、模型实际去向和会话状态。</p>
+  <div class="warning" role="note">
+    只输入合成数据。外部语义检测会在模型脱敏之前收到原文；“云端模拟本地路由”也会把原文发送到外部模型，不具备本地隔离能力。
+  </div>
+
+  <section class="card" aria-labelledby="sample-title">
+    <h2 id="sample-title">四条策略分支</h2>
+    <p class="muted">前三个示例各用新会话。先运行“测试密钥阻断”，再运行“同会话后续请求”，即可看到旧会话保持 LOCAL 约束。</p>
+    <div class="grid">
+      <button id="sample-cloud" type="button">普通内容 · CLOUD</button>
+      <button id="sample-mask" type="button">合成邮箱 · MASK_CLOUD</button>
+      <button id="sample-block" class="danger" type="button">测试密钥 · BLOCK</button>
+      <button id="sample-local" class="secondary" type="button" disabled>同会话后续请求 · LOCAL</button>
+    </div>
+    <p class="muted">LOCAL 示例只发送新的合成消息和相同会话 ID，故意省略之前的测试密钥；会话 ID 保存安全状态，不保存聊天上下文。</p>
+  </section>
+
+  <section class="card" aria-labelledby="manual-title">
+    <h2 id="manual-title">自定义合成请求</h2>
+    <label for="model">模型别名</label>
+    <select id="model"></select>
+    <label for="conversation">会话 ID（留空则创建新会话）</label>
+    <input id="conversation" maxlength="128" autocomplete="off" spellcheck="false">
+    <label for="prompt">本轮消息</label>
+    <textarea id="prompt" placeholder="请仅输入合成文本"></textarea>
+    <div class="actions">
+      <button id="send" type="button">发送</button>
+      <button id="new-conversation" class="secondary" type="button">新会话</button>
+      <span id="mode" class="muted"></span>
+    </div>
+    <p class="muted">页面每次只发送当前输入框中的消息。如需模型参考历史内容，客户端必须自行在 messages 中传递历史；此页面只演示网关路由。</p>
+  </section>
+
+  <section class="card" aria-labelledby="result-title" aria-live="polite">
+    <h2 id="result-title">结果</h2>
+    <div id="answer" class="result">尚未发送请求。</div>
+    <dl>
+      <dt>HTTP 状态</dt><dd id="status">—</dd>
+      <dt>策略动作</dt><dd id="action">—</dd>
+      <dt>实际目的地</dt><dd id="destination">—</dd>
+      <dt>模拟标志</dt><dd id="simulation">—</dd>
+      <dt>请求 ID</dt><dd id="request-id">—</dd>
+      <dt>会话 ID</dt><dd id="conversation-id">—</dd>
+    </dl>
+  </section>
+</main>
+<script>
+(() => {
+  "use strict";
+  let token = null;
+  let blockedConversation = null;
+  let busy = false;
+  const byId = id => document.getElementById(id);
+  const buttons = ["sample-cloud", "sample-mask", "sample-block", "sample-local", "send"];
+  function setBusy(value) {
+    busy = value;
+    for (const id of buttons) byId(id).disabled = value || !token || (id === "sample-local" && !blockedConversation);
+  }
+  function showResult(response, body) {
+    const action = response.headers.get("X-Aegis-Policy-Action");
+    const destination = response.headers.get("X-Aegis-Actual-Destination");
+    const simulation = response.headers.get("X-Aegis-Simulation");
+    const label = action === "LOCAL" && destination === "EXTERNAL" && simulation === "true"
+      ? "云端模拟本地路由" : (action || "未形成策略决定");
+    byId("status").textContent = String(response.status);
+    byId("action").textContent = label;
+    byId("destination").textContent = destination || "—";
+    byId("simulation").textContent = simulation || "—";
+    byId("request-id").textContent = response.headers.get("X-Aegis-Request-Id") || "—";
+    const conversation = response.headers.get("X-Aegis-Conversation-Id");
+    byId("conversation-id").textContent = conversation || "—";
+    if (conversation) byId("conversation").value = conversation;
+    byId("answer").textContent = response.ok
+      ? (body.choices?.[0]?.message?.content || "模型返回空内容。")
+      : (body.error?.code || "请求失败") + ": " + (body.error?.message || "未知错误");
+    return conversation;
+  }
+  async function send(text, conversationId, isBlockSample = false) {
+    if (busy || !token || !text.trim()) return;
+    setBusy(true);
+    byId("answer").textContent = "处理中…";
+    try {
+      const headers = { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" };
+      if (conversationId) headers["X-Aegis-Conversation-Id"] = conversationId;
+      const response = await fetch("/v1/chat/completions", {
+        method: "POST", headers, cache: "no-store",
+        body: JSON.stringify({ model: byId("model").value, messages: [{ role: "user", content: text }] })
+      });
+      const body = await response.json();
+      const returnedId = showResult(response, body);
+      if (isBlockSample && body.error?.code === "POLICY_BLOCKED") blockedConversation = returnedId;
+    } catch (_) {
+      byId("answer").textContent = "网络请求失败；请确认 Aegis 仍在运行。";
+    } finally { setBusy(false); }
+  }
+  byId("sample-cloud").addEventListener("click", () => send("Hello. Reply with one short greeting to this synthetic test.", null));
+  byId("sample-mask").addEventListener("click", () => send("A synthetic contact is demo.user@example.com. Reply with a short greeting.", null));
+  byId("sample-block").addEventListener("click", () => send("api_key=abcdefghijklmnop12345", null, true));
+  byId("sample-local").addEventListener("click", () => send("Summarize this synthetic follow-up in one sentence.", blockedConversation));
+  byId("send").addEventListener("click", () => send(byId("prompt").value, byId("conversation").value.trim()));
+  byId("new-conversation").addEventListener("click", () => { byId("conversation").value = ""; });
+  setBusy(false);
+  fetch("/demo/bootstrap", { cache: "no-store", credentials: "omit" })
+    .then(response => { if (!response.ok) throw new Error("bootstrap failed"); return response.json(); })
+    .then(config => {
+      token = config.token;
+      for (const alias of config.models) {
+        const option = document.createElement("option");
+        option.value = alias;
+        option.textContent = alias;
+        byId("model").append(option);
+      }
+      byId("mode").textContent = config.local_mode === "simulated_local"
+        ? "LOCAL 使用云端模拟" : "LOCAL 使用 Mock";
+      setBusy(false);
+    })
+    .catch(() => { byId("answer").textContent = "无法初始化演示页面。"; });
+})();
+</script>
+</body>
+</html>

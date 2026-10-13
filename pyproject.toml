@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aegis-gateway"
-version = "0.4.0"
+version = "0.5.0"
 description = "Security gateway for LLM applications"
 requires-python = ">=3.13,<3.14"
 dependencies = [
@@ -32,7 +32,7 @@ dev = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-aegis = ["default_policy.yaml"]
+aegis = ["default_policy.yaml", "demo.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -17,7 +17,7 @@ class Settings(BaseModel):
     api_keys: dict[str, str]
     hmac_key: str = Field(min_length=32)
     run_mode: Literal["strict", "demo"] = "strict"
-    demo_provider: Literal["mock"] | None = None
+    demo_provider: Literal["mock", "simulated_local"] | None = None
     model_aliases: dict[str, str] = Field(default_factory=lambda: {"aegis-mock": "mock-v1"})
     policy_path: str | None = None
     semantic_url: str | None = None
@@ -42,8 +42,8 @@ class Settings(BaseModel):
             raise ValueError("at least one model alias is required")
         if self.run_mode == "strict" and self.demo_provider is not None:
             raise ValueError("strict mode cannot load a demo provider")
-        if self.run_mode == "demo" and self.demo_provider != "mock":
-            raise ValueError("demo mode requires AEGIS_DEMO_PROVIDER=mock")
+        if self.run_mode == "demo" and self.demo_provider is None:
+            raise ValueError("demo mode requires AEGIS_DEMO_PROVIDER")
         semantic_values = (self.semantic_url, self.semantic_api_key, self.semantic_model)
         if any(semantic_values) and not all(semantic_values):
             raise ValueError("semantic URL, API key and model must all be configured")
@@ -55,6 +55,8 @@ class Settings(BaseModel):
             raise ValueError("cloud base URL and API key must be configured together")
         if self.run_mode == "strict" and self.cloud_base_url is not None:
             raise ValueError("strict mode cannot load an external cloud provider")
+        if self.demo_provider == "simulated_local" and self.cloud_base_url is None:
+            raise ValueError("simulated local provider requires cloud configuration")
         if self.cloud_base_url is not None:
             self._validate_endpoint(self.cloud_base_url, "cloud base URL")
         return self
