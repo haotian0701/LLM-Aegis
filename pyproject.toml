@@ -4,21 +4,24 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aegis-gateway"
-version = "0.1.0"
+version = "0.2.0"
 description = "Security gateway for LLM applications"
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "alembic>=1.15,<2",
     "fastapi>=0.115,<1",
+    "httpx>=0.27,<1",
     "psycopg[binary]>=3.2,<4",
     "pydantic>=2.10,<3",
+    "pyyaml>=6,<7",
+    "spacy>=3.8.7,<3.9",
+    "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
     "sqlalchemy[asyncio]>=2.0,<3",
     "uvicorn>=0.30,<1",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "httpx>=0.27,<1",
     "pyright[nodejs]>=1.1,<2",
     "pytest>=8,<10",
     "pytest-asyncio>=0.25,<2",
@@ -27,6 +30,9 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+aegis = ["default_policy.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

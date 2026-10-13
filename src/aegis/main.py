@@ -1,4 +1,4 @@
-"""Aegis HTTP gateway, stage 1."""
+"""Aegis HTTP gateway with stage 2 fail-closed detection and policy."""
 
 from __future__ import annotations
 
@@ -17,6 +17,15 @@ from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from aegis.config import Settings
+from aegis.detection import (
+    NerDetector,
+    RuleDetector,
+    SpacyEnglishNer,
+    extract_fragments,
+    text_bytes,
+    unique_findings,
+)
+from aegis.policy import UPGRADE_CATEGORIES, Action, PolicyEngine
 from aegis.provider import MockLocalProvider, ModelProvider
 from aegis.schemas import (
     ChatCompletionChoice,
@@ -24,9 +33,12 @@ from aegis.schemas import (
     ChatCompletionResponse,
     ChatRequest,
 )
+from aegis.semantic import OpenAICompatibleSemanticDetector, SemanticDetector
 from aegis.store import AuditDraft, PostgresRequestStore, RequestStore
 
 CONVERSATION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+MAX_BODY_BYTES = 128 * 1024
+MAX_TEXT_BYTES = 32 * 1024
 
 
 def _error(
@@ -82,12 +94,7 @@ def _rejection(request_id: str, principal_id: str | None, code: str) -> AuditDra
         principal_id=principal_id,
         conversation_id=None,
         status="REJECTED",
-        policy_action=None,
-        actual_destination="NONE",
-        provider_name=None,
         model_alias=None,
-        provider_model=None,
-        simulation=False,
         prompt_hmac=None,
         error_code=code,
     )
@@ -98,14 +105,32 @@ def create_app(
     *,
     store: RequestStore | None = None,
     provider: ModelProvider | None = None,
+    rule_detector: RuleDetector | None = None,
+    ner_detector: NerDetector | None = None,
+    semantic_detector: SemanticDetector | None = None,
+    policy: PolicyEngine | None = None,
 ) -> FastAPI:
-    """Build the gateway. Tests may inject storage and a provider without a database."""
+    """Build the gateway; tests may inject detectors, storage and providers."""
     settings = settings or Settings.from_env()
     if settings.run_mode == "strict":
         if provider is not None and provider.simulation:
             raise ValueError("strict mode cannot use a simulated provider")
+        if semantic_detector is not None and semantic_detector.external:
+            raise ValueError("strict mode cannot use an external semantic detector")
     elif provider is None:
         provider = MockLocalProvider()
+
+    policy = policy or PolicyEngine.load(settings.policy_path)
+    rule_detector = rule_detector or RuleDetector()
+    ner_detector = ner_detector or SpacyEnglishNer()
+    if settings.run_mode == "demo" and semantic_detector is None and settings.semantic_url:
+        assert settings.semantic_api_key is not None
+        assert settings.semantic_model is not None
+        semantic_detector = OpenAICompatibleSemanticDetector(
+            url=settings.semantic_url,
+            api_key=settings.semantic_api_key,
+            model=settings.semantic_model,
+        )
 
     engine = None
     if store is None:
@@ -119,10 +144,11 @@ def create_app(
         if engine is not None:
             await engine.dispose()
 
-    app = FastAPI(title="Aegis Gateway", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Aegis Gateway", version="0.2.0", lifespan=lifespan)
     app.state.settings = settings
     app.state.store = store
     app.state.provider = provider
+    app.state.policy = policy
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -145,7 +171,6 @@ def create_app(
         principal_id = _authenticate(http_request.headers.get("authorization"), settings.api_keys)
         if principal_id is None:
             return await reject(401, "UNAUTHORIZED", "Invalid API token.", None)
-
         if (
             http_request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
             != "application/json"
@@ -154,17 +179,22 @@ def create_app(
                 400, "INVALID_REQUEST", "JSON request body is required.", principal_id
             )
 
+        body = bytearray()
+        async for chunk in http_request.stream():
+            if len(body) + len(chunk) > MAX_BODY_BYTES:
+                return await reject(
+                    413, "INVALID_REQUEST", "Request body is too large.", principal_id
+                )
+            body.extend(chunk)
         try:
-            raw_body = await http_request.json()
+            raw_body = json.loads(body.decode("utf-8"))
             chat_request = ChatRequest.model_validate(raw_body)
         except (ValueError, ValidationError, UnicodeDecodeError):
             return await reject(
                 400, "INVALID_REQUEST", "Invalid or unsupported request body.", principal_id
             )
-
         if chat_request.model not in settings.model_aliases:
             return await reject(400, "INVALID_REQUEST", "Unknown model alias.", principal_id)
-
         if any(
             value is not None
             for value in (
@@ -176,33 +206,179 @@ def create_app(
             return await reject(
                 400,
                 "UNSUPPORTED_FEATURE",
-                "Generation parameters are not supported by the stage 1 provider.",
+                "Generation parameters are not supported by the stage 2 provider.",
                 principal_id,
             )
-
         supplied_id = http_request.headers.get("x-aegis-conversation-id")
         if supplied_id is not None and CONVERSATION_ID_PATTERN.fullmatch(supplied_id) is None:
             return await reject(400, "INVALID_REQUEST", "Invalid conversation ID.", principal_id)
+        fragments = extract_fragments(chat_request)
+        if text_bytes(fragments) > MAX_TEXT_BYTES:
+            return await reject(413, "INVALID_REQUEST", "Message text is too large.", principal_id)
         conversation_id = supplied_id if supplied_id is not None else uuid4().hex
 
-        actual_destination = provider.destination if provider is not None else "NONE"
         draft = AuditDraft(
             request_id=request_id,
             principal_id=principal_id,
             conversation_id=conversation_id,
             status="PENDING",
-            policy_action="LOCAL",
-            actual_destination=actual_destination,
-            provider_name=provider.name if provider is not None else None,
             model_alias=chat_request.model,
-            provider_model=settings.model_aliases[chat_request.model]
-            if provider is not None
-            else None,
-            simulation=provider.simulation if provider is not None else False,
             prompt_hmac=_prompt_hmac(chat_request, settings.hmac_key),
         )
         try:
-            await store.prepare_dispatch(draft)
+            was_sensitive = await store.begin_request(draft)
+        except Exception:
+            return _error(
+                503,
+                "AUDIT_UNAVAILABLE",
+                "Audit storage is unavailable.",
+                request_id,
+                conversation_id,
+            )
+
+        async def finish_error(
+            code: str,
+            message: str,
+            *,
+            detection_status: str,
+            semantic_call_status: str | None = None,
+        ) -> JSONResponse:
+            try:
+                await store.finish_dispatch(
+                    request_id,
+                    status="FAILED",
+                    error_code=code,
+                    duration_ms=max(0, round((time.perf_counter() - started) * 1000)),
+                    detection_status=detection_status,
+                    semantic_call_status=semantic_call_status,
+                    detected_categories=sorted({finding.category.value for finding in findings}),
+                    detector_durations_ms=durations,
+                )
+            except Exception:
+                return _error(
+                    503,
+                    "AUDIT_UNAVAILABLE",
+                    "Audit storage is unavailable.",
+                    request_id,
+                    conversation_id,
+                )
+            return _error(503, code, message, request_id, conversation_id)
+
+        findings = []
+        durations: dict[str, int] = {}
+        local_failure = False
+        locally_blocked = False
+        try:
+            detector_started = time.perf_counter()
+            findings.extend(rule_detector.detect(fragments))
+            durations["rules"] = max(0, round((time.perf_counter() - detector_started) * 1000))
+            locally_blocked = (
+                policy.decide(
+                    (finding.category for finding in findings), was_sensitive=was_sensitive
+                )
+                == Action.BLOCK
+            )
+            if not locally_blocked:
+                detector_started = time.perf_counter()
+                findings.extend(await ner_detector.detect(fragments))
+                durations["ner"] = max(0, round((time.perf_counter() - detector_started) * 1000))
+        except Exception:
+            local_failure = True
+        findings = unique_findings(findings)
+        categories = {finding.category for finding in findings}
+        if not local_failure:
+            try:
+                locally_blocked = (
+                    policy.decide(categories, was_sensitive=was_sensitive) == Action.BLOCK
+                )
+            except Exception:
+                local_failure = True
+
+        if local_failure and settings.run_mode == "demo":
+            return await finish_error(
+                "SECURITY_UNAVAILABLE",
+                "Security detection is unavailable.",
+                detection_status="FAILED",
+            )
+
+        semantic_succeeded = False
+        if (
+            not local_failure
+            and not locally_blocked
+            and not was_sensitive
+            and settings.run_mode == "demo"
+            and fragments
+        ):
+            if semantic_detector is None:
+                return await finish_error(
+                    "SECURITY_UNAVAILABLE",
+                    "Semantic detection is unavailable.",
+                    detection_status="UNAVAILABLE",
+                )
+            try:
+                await store.record_external_intent(
+                    request_id, provider_name=semantic_detector.name, model=semantic_detector.model
+                )
+            except Exception:
+                return _error(
+                    503,
+                    "AUDIT_UNAVAILABLE",
+                    "Audit storage is unavailable.",
+                    request_id,
+                    conversation_id,
+                )
+            detector_started = time.perf_counter()
+            try:
+                findings.extend(await semantic_detector.detect(fragments))
+                durations["semantic"] = max(
+                    0, round((time.perf_counter() - detector_started) * 1000)
+                )
+                semantic_succeeded = True
+            except Exception:
+                durations["semantic"] = max(
+                    0, round((time.perf_counter() - detector_started) * 1000)
+                )
+                return await finish_error(
+                    "SECURITY_UNAVAILABLE",
+                    "Semantic detection failed.",
+                    detection_status="FAILED",
+                    semantic_call_status="FAILED",
+                )
+
+        findings = unique_findings(findings)
+        categories = {finding.category for finding in findings}
+        try:
+            action = policy.decide(categories, was_sensitive=was_sensitive)
+        except Exception:
+            if settings.run_mode == "demo":
+                return await finish_error(
+                    "SECURITY_UNAVAILABLE", "Policy evaluation failed.", detection_status="FAILED"
+                )
+            action = Action.LOCAL
+            local_failure = True
+        if (local_failure or settings.run_mode == "strict") and action != Action.BLOCK:
+            action = Action.LOCAL
+        detection_status = (
+            "DEGRADED" if local_failure or settings.run_mode == "strict" else "COMPLETE"
+        )
+        try:
+            action = await store.record_decision(
+                request_id,
+                principal_id=principal_id,
+                conversation_id=conversation_id,
+                action=action,
+                categories=sorted(category.value for category in categories),
+                detection_status=detection_status,
+                detector_durations_ms=durations,
+                upgrade_sensitive=bool(categories & UPGRADE_CATEGORIES),
+                local_destination=provider.destination if provider is not None else "NONE",
+                local_provider_name=provider.name if provider is not None else None,
+                local_model=settings.model_aliases[chat_request.model]
+                if provider is not None
+                else None,
+                local_simulation=provider.simulation if provider is not None else False,
+                semantic_succeeded=semantic_succeeded,
+            )
         except Exception:
             return _error(
                 503,
@@ -215,7 +391,19 @@ def create_app(
         status = "SUCCEEDED"
         error_code: str | None = None
         response: JSONResponse
-        if provider is None:
+        if action == Action.BLOCK:
+            status = "BLOCKED"
+            error_code = "POLICY_BLOCKED"
+            response = _error(
+                403, error_code, "Request blocked by policy.", request_id, conversation_id
+            )
+        elif action in {Action.CLOUD, Action.MASK_CLOUD}:
+            status = "FAILED"
+            error_code = "ROUTE_UNAVAILABLE"
+            response = _error(
+                503, error_code, "Selected route is not available yet.", request_id, conversation_id
+            )
+        elif provider is None:
             status = "FAILED"
             error_code = "LOCAL_UNAVAILABLE"
             response = _error(
@@ -256,10 +444,12 @@ def create_app(
                     502, error_code, "Local provider failed.", request_id, conversation_id
                 )
 
-        duration_ms = max(0, round((time.perf_counter() - started) * 1000))
         try:
             await store.finish_dispatch(
-                request_id, status=status, error_code=error_code, duration_ms=duration_ms
+                request_id,
+                status=status,
+                error_code=error_code,
+                duration_ms=max(0, round((time.perf_counter() - started) * 1000)),
             )
         except Exception:
             return _error(

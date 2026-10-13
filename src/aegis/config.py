@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -18,6 +19,10 @@ class Settings(BaseModel):
     run_mode: Literal["strict", "demo"] = "strict"
     demo_provider: Literal["mock"] | None = None
     model_aliases: dict[str, str] = Field(default_factory=lambda: {"aegis-mock": "mock-v1"})
+    policy_path: str | None = None
+    semantic_url: str | None = None
+    semantic_api_key: str | None = None
+    semantic_model: str | None = None
 
     @model_validator(mode="after")
     def validate_security_settings(self) -> Settings:
@@ -37,6 +42,21 @@ class Settings(BaseModel):
             raise ValueError("strict mode cannot load a demo provider")
         if self.run_mode == "demo" and self.demo_provider != "mock":
             raise ValueError("demo mode requires AEGIS_DEMO_PROVIDER=mock")
+        semantic_values = (self.semantic_url, self.semantic_api_key, self.semantic_model)
+        if any(semantic_values) and not all(semantic_values):
+            raise ValueError("semantic URL, API key and model must all be configured")
+        if self.run_mode == "strict" and any(semantic_values):
+            raise ValueError("strict mode cannot load an external semantic detector")
+        if self.semantic_url is not None:
+            parsed = urlsplit(self.semantic_url)
+            if parsed.username or parsed.password or parsed.query or parsed.fragment:
+                raise ValueError("semantic URL cannot contain credentials, query or fragment")
+            if parsed.scheme != "https" and not (
+                parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+            ):
+                raise ValueError("semantic URL must use HTTPS outside loopback")
+            if not parsed.hostname:
+                raise ValueError("semantic URL needs a hostname")
         return self
 
     @classmethod
@@ -60,5 +80,9 @@ class Settings(BaseModel):
                 "run_mode": os.environ.get("AEGIS_RUN_MODE", "strict"),
                 "demo_provider": os.environ.get("AEGIS_DEMO_PROVIDER") or None,
                 "model_aliases": model_aliases,
+                "policy_path": os.environ.get("AEGIS_POLICY_PATH") or None,
+                "semantic_url": os.environ.get("AEGIS_SEMANTIC_URL") or None,
+                "semantic_api_key": os.environ.get("AEGIS_SEMANTIC_API_KEY") or None,
+                "semantic_model": os.environ.get("AEGIS_SEMANTIC_MODEL") or None,
             }
         )

@@ -1,0 +1,12 @@
+default_action: CLOUD
+rules:
+  - {category: API_KEY, action: BLOCK}
+  - {category: SECRET, action: BLOCK}
+  - {category: BUSINESS_SECRET, action: LOCAL}
+  - {category: EMAIL, action: MASK_CLOUD}
+  - {category: IBAN, action: MASK_CLOUD}
+  - {category: PHONE, action: MASK_CLOUD}
+  - {category: IP_ADDRESS, action: MASK_CLOUD}
+  - {category: PERSON, action: MASK_CLOUD}
+  - {category: ORGANIZATION, action: MASK_CLOUD}
+  - {category: LOCATION, action: MASK_CLOUD}
