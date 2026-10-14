@@ -1,6 +1,6 @@
 # Aegis Gateway
 
-Stage 5 adds an explicit demo-only cloud simulation for `LOCAL` decisions and a loopback browser demo. Stage 6 begins with a route acceptance matrix and per-request audit details in that demo. A simulated `LOCAL` call sends the original message to an external model; it does not provide local isolation. The external semantic classifier also receives the original supported text **before masking**. Use synthetic data only.
+The gateway routes requests through detection, policy, providers, and a PostgreSQL audit trail. In `demo` mode, its English Decision Console lets you send requests, inspect routing results, browse audit records, and read conversation state.
 
 ## Run locally (PowerShell)
 
@@ -45,12 +45,27 @@ The model route receives raw text for `CLOUD` and masked text for `MASK_CLOUD`. 
 
 To use the configured cloud model for `LOCAL` decisions, explicitly set `AEGIS_DEMO_PROVIDER=simulated_local` instead of `mock` and restart Aegis. It reuses `AEGIS_CLOUD_BASE_URL`, `AEGIS_CLOUD_API_KEY`, and `AEGIS_MODEL_ALIASES_JSON`; incomplete cloud configuration prevents startup. This route is identified as `simulated-local-openai-compatible` in the audit, with `policy_action=LOCAL`, `actual_destination=EXTERNAL`, and `simulation=true` after model egress intent commits. Security failures and model errors do not fall back to another route.
 
-In demo mode, open **http://127.0.0.1:8000/** on the same computer for the browser demo. The page automatically uses a temporary, process-scoped token for its own audit principal; it never displays the configured long-lived client token. The page and temporary token are only available on loopback and disappear in strict mode. It provides synthetic examples for `CLOUD`, `MASK_CLOUD`, `BLOCK`, and a follow-up `LOCAL` request using the blocked conversation ID. The follow-up deliberately omits the earlier text to demonstrate persisted security state. The page sends only the current message, so a separate client must pass history when model context is needed.
+## Decision Console
 
-After each browser request, the page reads `/demo/audit/{request_id}` and shows detected categories, detection status, masking status, and model call status. The request ID can also be pasted into the lookup field. The endpoint accepts only the current process's browser token on loopback and returns records belonging to that browser principal; it returns no prompt text, Prompt HMAC, or credentials. `masking_status=SUCCEEDED` means the gateway validated the masked request and committed model egress intent. The outbound-payload acceptance test verifies what a fake cloud model actually receives:
+Install Node.js 24 LTS for frontend development. From `frontend/`, install the locked dependencies and build the English page before starting Aegis:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests/test_stage_six.py tests/test_cloud_routing.py::test_masked_history_and_tool_arguments_reach_cloud_as_placeholders -q
+cd frontend
+npm ci
+npm run typecheck
+npm run build
+cd ..
+.\.venv\Scripts\python -m aegis
+```
+
+Open **http://127.0.0.1:8000/** in `demo` mode. The API starts without Node installed or a frontend build; if assets are missing, `/` explains which build commands to run. `strict` mode does not expose the console or demo APIs. The console fetches a process-scoped temporary token for a separate demo principal and keeps it in page memory. It never reads configured client tokens. A reload clears chat text and obtains a new temporary token.
+
+For frontend development, start the Python API, then run `npm run dev` in `frontend/` and open the Vite URL. Vite proxies `/v1`, `/demo`, and `/healthz` to `127.0.0.1:8000`. The console offers **Single-turn test**, which sends only the current message, and **Continuous chat**, which resends successful turns held in current-tab memory. Both modes pass the conversation ID explicitly. The examples exercise `CLOUD`, `MASK_CLOUD`, `BLOCK`, and a follow-up `LOCAL` request using the blocked conversation ID.
+
+The audit list supports action, status, and conversation filters with signed cursor pagination and shows metadata only. The detail view shows decision state, provider identity, detection timing, and model call status. For demo-browser `MASK_CLOUD` requests, it also shows the masked messages prepared for the model; older records have no saved preview. `/demo/audits`, `/demo/audit/{request_id}`, and `/demo/conversations/{conversation_id}` require the temporary token, loopback origin and Host, and only return the demo principal's records. `masking_status=SUCCEEDED` means the gateway validated the masked request and committed model egress intent. The outbound-payload acceptance test verifies what a fake cloud model actually receives:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/api/test_routing_acceptance.py tests/api/test_cloud_routing.py::test_masked_history_and_tool_arguments_reach_cloud_as_placeholders -q
 ```
 
 Completed decisions include `X-Aegis-Policy-Action`, `X-Aegis-Actual-Destination`, and `X-Aegis-Simulation` response headers. Errors before a policy decision do not include these headers.
@@ -97,6 +112,10 @@ Recovery does not clear sensitive state. If the abandoned request has no committ
 
 The bundled YAML policy maps API keys and secrets to `BLOCK`, business secrets to `LOCAL`, and detected personal or network identifiers to `MASK_CLOUD`. A custom YAML file can be selected with `AEGIS_POLICY_PATH`; invalid or incomplete policies prevent startup. The request body limit is 128 KiB, and the extracted text limit is 32 KiB. Cloud and simulated `LOCAL` requests forward `temperature`, `top_p`, and `max_tokens`; local Mock requests reject them. Strict mode continues to choose `LOCAL` because no trusted local semantic classifier is available.
 
+## CI
+
+`.github/workflows/ci.yml` checks pushes to `main` and `feat/frontend-console`, pull requests into `main`, and manual runs. It runs Python lint, formatting, typing, and unit/API tests; applies Alembic migrations and runs PostgreSQL integration tests against a temporary PostgreSQL 17 service; builds and tests the frontend; and runs the browser smoke test with fake providers. All jobs use read-only repository permissions. CI does not publish or deploy artifacts.
+
 ## Check
 
 ```powershell
@@ -106,4 +125,17 @@ The bundled YAML policy maps API keys and secrets to `BLOCK`, business secrets t
 .\.venv\Scripts\pyright
 ```
 
-The HTTP tests use a fake store and fake semantic HTTP service. To run the PostgreSQL integration test after `alembic upgrade head`, set `AEGIS_TEST_DATABASE_URL` to the same PostgreSQL URL and rerun pytest.
+Tests are grouped by dependency: `tests/unit/` covers focused components, `tests/api/` exercises the HTTP gateway with fake storage and providers, and `tests/integration/` uses PostgreSQL. Run a group with `python -m pytest tests/unit`, `python -m pytest tests/api`, or `python -m pytest tests/integration`. PostgreSQL tests require `AEGIS_TEST_DATABASE_URL` and an upgraded database; without it they are skipped. The browser fixture uses the shared fake dependencies in `tests/support.py`.
+
+Frontend checks from `frontend/`:
+
+```powershell
+npm ci
+npm run format:check
+npm run typecheck
+npm test
+npm run build
+npm run browser:smoke
+```
+
+The browser smoke command starts a local fake-provider fixture and checks the four policy examples, audit lookup, narrow layout, and keyboard activation using the installed Chrome. Set `AEGIS_CHROME` and `AEGIS_PYTHON` if those executables are at different paths.

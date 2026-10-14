@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hmac
 import ipaddress
 import json
@@ -13,11 +14,12 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime
 from hashlib import sha256
-from importlib.resources import files
+from pathlib import Path
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -52,6 +54,49 @@ REQUEST_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
 MAX_BODY_BYTES = 128 * 1024
 MAX_TEXT_BYTES = 32 * 1024
 DEMO_PRINCIPAL = "__aegis_demo_browser__"
+FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+
+
+def _audit_cursor(
+    secret: str, filters: dict[str, str | None], started_at: datetime, request_id: str
+) -> str:
+    data = json.dumps(
+        {
+            "principal": DEMO_PRINCIPAL,
+            "filters": filters,
+            "started_at": started_at.isoformat(),
+            "request_id": request_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    signature = hmac.new(secret.encode("utf-8"), data, sha256).digest()
+    return base64.urlsafe_b64encode(data + signature).decode("ascii").rstrip("=")
+
+
+def _read_audit_cursor(
+    cursor: str, secret: str, filters: dict[str, str | None]
+) -> tuple[datetime, str]:
+    if len(cursor) > 2048:
+        raise ValueError("invalid cursor")
+    try:
+        raw = base64.b64decode(cursor + "=" * (-len(cursor) % 4), altchars=b"-_", validate=True)
+        data, signature = raw[:-32], raw[-32:]
+        expected = hmac.new(secret.encode("utf-8"), data, sha256).digest()
+        if len(signature) != 32 or not hmac.compare_digest(signature, expected):
+            raise ValueError("invalid signature")
+        payload = json.loads(data)
+        if payload["principal"] != DEMO_PRINCIPAL or payload["filters"] != filters:
+            raise ValueError("cursor scope mismatch")
+        started_at = datetime.fromisoformat(payload["started_at"])
+        request_id = payload["request_id"]
+        if started_at.tzinfo is None or not isinstance(request_id, str):
+            raise ValueError("invalid cursor contents")
+        if REQUEST_ID_PATTERN.fullmatch(request_id) is None:
+            raise ValueError("invalid request ID")
+        return started_at, request_id
+    except (KeyError, TypeError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("invalid cursor") from exc
 
 
 def _local_demo_request(request: Request) -> bool:
@@ -206,14 +251,13 @@ def create_app(
         if DEMO_PRINCIPAL in settings.api_keys:
             raise ValueError("reserved demo browser principal is configured")
         demo_token = secrets.token_urlsafe(32)
-        demo_page = files("aegis").joinpath("demo.html").read_text(encoding="utf-8")
         demo_headers = {
             "Cache-Control": "no-store",
             "Referrer-Policy": "no-referrer",
             "X-Content-Type-Options": "nosniff",
             "Content-Security-Policy": (
-                "default-src 'none'; script-src 'unsafe-inline'; "
-                "style-src 'unsafe-inline'; connect-src 'self'; "
+                "default-src 'none'; script-src 'self'; "
+                "style-src 'self'; connect-src 'self'; img-src 'self' data:; "
                 "base-uri 'none'; form-action 'none'"
             ),
         }
@@ -222,7 +266,25 @@ def create_app(
         async def demo_home(request: Request) -> HTMLResponse:
             if not _local_demo_request(request):
                 return HTMLResponse("Not found", status_code=404)
-            return HTMLResponse(demo_page, headers=demo_headers)
+            index = FRONTEND_DIST / "index.html"
+            if not index.is_file():
+                return HTMLResponse(
+                    "<h1>Aegis frontend build required</h1><p>Run npm ci and npm run build "
+                    "in the frontend directory.</p>",
+                    status_code=503,
+                    headers=demo_headers,
+                )
+            return HTMLResponse(index.read_text(encoding="utf-8"), headers=demo_headers)
+
+        @app.get("/assets/{asset_path:path}", include_in_schema=False)
+        async def demo_asset(request: Request, asset_path: str) -> Response:
+            if not _local_demo_request(request):
+                return JSONResponse({"detail": "Not found"}, status_code=404)
+            asset_root = (FRONTEND_DIST / "assets").resolve()
+            asset = (asset_root / asset_path).resolve()
+            if not asset.is_relative_to(asset_root) or not asset.is_file():
+                return JSONResponse({"detail": "Not found"}, status_code=404)
+            return FileResponse(asset, headers=demo_headers)
 
         @app.get("/demo/bootstrap", include_in_schema=False)
         async def demo_bootstrap(request: Request) -> JSONResponse:
@@ -237,8 +299,7 @@ def create_app(
                 headers=demo_headers,
             )
 
-        @app.get("/demo/audit/{request_id}", include_in_schema=False)
-        async def demo_audit(request: Request, request_id: str) -> JSONResponse:
+        def demo_read_denial(request: Request) -> JSONResponse | None:
             if not _local_demo_request(request):
                 return JSONResponse({"detail": "Not found"}, status_code=404, headers=demo_headers)
             authorization = request.headers.get("authorization")
@@ -251,6 +312,100 @@ def create_app(
                 return JSONResponse(
                     {"detail": "Unauthorized"}, status_code=401, headers=demo_headers
                 )
+            return None
+
+        @app.get("/demo/audits", include_in_schema=False)
+        async def demo_audits(request: Request) -> JSONResponse:
+            denial = demo_read_denial(request)
+            if denial is not None:
+                return denial
+            query = request.query_params
+            try:
+                if set(query) - {"limit", "cursor", "policy_action", "status", "conversation_id"}:
+                    raise ValueError("unknown filter")
+                limit = int(query.get("limit", "20"))
+                if not 1 <= limit <= 100:
+                    raise ValueError("invalid limit")
+                action = query.get("policy_action")
+                status = query.get("status")
+                conversation_id = query.get("conversation_id")
+                if action is not None and action not in {item.value for item in Action}:
+                    raise ValueError("invalid action")
+                if status is not None and status not in {
+                    "PENDING",
+                    "SUCCEEDED",
+                    "FAILED",
+                    "REJECTED",
+                    "BLOCKED",
+                }:
+                    raise ValueError("invalid status")
+                if (
+                    conversation_id is not None
+                    and CONVERSATION_ID_PATTERN.fullmatch(conversation_id) is None
+                ):
+                    raise ValueError("invalid conversation ID")
+                filters = {
+                    "policy_action": action,
+                    "status": status,
+                    "conversation_id": conversation_id,
+                }
+                before = (
+                    _read_audit_cursor(query["cursor"], settings.hmac_key, filters)
+                    if "cursor" in query
+                    else None
+                )
+            except ValueError:
+                return JSONResponse(
+                    {"detail": "Invalid audit query"}, status_code=400, headers=demo_headers
+                )
+            try:
+                items = await store.list_audits(
+                    DEMO_PRINCIPAL,
+                    limit=limit + 1,
+                    policy_action=action,
+                    status=status,
+                    conversation_id=conversation_id,
+                    before=before,
+                )
+            except Exception:
+                return JSONResponse(
+                    {"detail": "Audit unavailable"}, status_code=503, headers=demo_headers
+                )
+            page = items[:limit]
+            next_cursor = None
+            if len(items) > limit and page and page[-1].started_at is not None:
+                next_cursor = _audit_cursor(
+                    settings.hmac_key, filters, page[-1].started_at, page[-1].request_id
+                )
+            return JSONResponse(
+                jsonable_encoder(
+                    {"items": [asdict(item) for item in page], "next_cursor": next_cursor}
+                ),
+                headers=demo_headers,
+            )
+
+        @app.get("/demo/conversations/{conversation_id}", include_in_schema=False)
+        async def demo_conversation(request: Request, conversation_id: str) -> JSONResponse:
+            denial = demo_read_denial(request)
+            if denial is not None:
+                return denial
+            if CONVERSATION_ID_PATTERN.fullmatch(conversation_id) is None:
+                return JSONResponse({"detail": "Not found"}, status_code=404, headers=demo_headers)
+            try:
+                summary = await store.get_conversation_summary(conversation_id, DEMO_PRINCIPAL)
+            except Exception:
+                return JSONResponse(
+                    {"detail": "Conversation unavailable"}, status_code=503, headers=demo_headers
+                )
+            if summary is None:
+                return JSONResponse({"detail": "Not found"}, status_code=404, headers=demo_headers)
+            return JSONResponse(jsonable_encoder(asdict(summary)), headers=demo_headers)
+
+        @app.get("/demo/audit/{request_id}", include_in_schema=False)
+        async def demo_audit(request: Request, request_id: str) -> JSONResponse:
+            denial = demo_read_denial(request)
+            if denial is not None:
+                return denial
             if REQUEST_ID_PATTERN.fullmatch(request_id) is None:
                 return JSONResponse({"detail": "Not found"}, status_code=404, headers=demo_headers)
             try:
@@ -261,7 +416,7 @@ def create_app(
                 )
             if summary is None:
                 return JSONResponse({"detail": "Not found"}, status_code=404, headers=demo_headers)
-            return JSONResponse(asdict(summary), headers=demo_headers)
+            return JSONResponse(jsonable_encoder(asdict(summary)), headers=demo_headers)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -583,6 +738,14 @@ def create_app(
                                 provider_name=cloud_provider.name,
                                 model=settings.model_aliases[chat_request.model],
                                 masked=masked_request is not None,
+                                masked_messages=(
+                                    [
+                                        message.model_dump(exclude_none=True)
+                                        for message in outbound.messages
+                                    ]
+                                    if masked_request is not None and principal_id == DEMO_PRINCIPAL
+                                    else None
+                                ),
                             )
                         except Exception:
                             return _route_headers(

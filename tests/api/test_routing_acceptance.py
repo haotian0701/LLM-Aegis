@@ -7,10 +7,10 @@ from typing import Any
 
 import httpx
 import pytest
-from test_gateway import EmptyNer, FakeSemantic, MemoryStore, auth, payload, settings
 
 from aegis.main import create_app
 from aegis.provider import OpenAICompatibleCloudProvider, SimulatedLocalProvider
+from tests.support import EmptyNer, FakeSemantic, MemoryStore, auth, payload, settings
 
 
 @pytest.mark.parametrize(
@@ -118,6 +118,9 @@ async def test_acceptance_matrix_inspects_actual_model_request(
     assert summary["detected_categories"] == categories, name
     assert summary["masking_status"] == audit["masking_status"], name
     assert summary["model_call_status"] == audit["model_call_status"], name
+    assert summary["masked_messages"] == (outbound[0]["messages"] if sent == "MASKED" else None), (
+        name
+    )
     assert "prompt_hmac" not in summary and message not in summary_response.text, name
     assert audit["masking_status"] == ("SUCCEEDED" if sent == "MASKED" else None), name
     assert audit["model_call_status"] == ("SUCCEEDED" if sent != "NONE" else None), name
@@ -149,7 +152,7 @@ async def test_demo_audit_lookup_is_scoped_to_process_token_and_principal() -> N
         base_url="http://127.0.0.1",
     ) as client:
         page = await client.get("/")
-        assert "按请求 ID 查看本页审计" in page.text
+        assert "Aegis" in page.text
         token = (await client.get("/demo/bootstrap")).json()["token"]
         demo_headers = {"Authorization": f"Bearer {token}"}
         masked = await client.post(

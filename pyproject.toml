@@ -32,7 +32,7 @@ dev = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-aegis = ["default_policy.yaml", "demo.html"]
+aegis = ["default_policy.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

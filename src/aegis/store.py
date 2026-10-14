@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Literal, Protocol
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -46,6 +46,25 @@ class AuditSummary:
     masking_status: str | None
     model_call_status: str | None
     error_code: str | None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    conversation_state_before: str | None = None
+    conversation_state_after: str | None = None
+    conversation_state_version: int | None = None
+    provider_name: str | None = None
+    provider_model: str | None = None
+    detector_durations_ms: dict[str, int] | None = None
+    total_duration_ms: int | None = None
+    masked_messages: list[dict[str, object]] | None = None
+
+
+@dataclass(frozen=True)
+class ConversationSummary:
+    conversation_id: str
+    state: str
+    state_version: int
+    active_request: bool
+    updated_at: datetime | None
 
 
 class ConversationNotFound(Exception):
@@ -71,6 +90,21 @@ class RequestStore(Protocol):
         self, request_id: str, principal_id: str
     ) -> AuditSummary | None: ...
 
+    async def list_audits(
+        self,
+        principal_id: str,
+        *,
+        limit: int,
+        policy_action: str | None,
+        status: str | None,
+        conversation_id: str | None,
+        before: tuple[datetime, str] | None,
+    ) -> list[AuditSummary]: ...
+
+    async def get_conversation_summary(
+        self, conversation_id: str, principal_id: str
+    ) -> ConversationSummary | None: ...
+
     async def record_rejection(self, draft: AuditDraft) -> None: ...
 
     async def begin_request(self, draft: AuditDraft) -> BeginResult: ...
@@ -80,7 +114,13 @@ class RequestStore(Protocol):
     ) -> None: ...
 
     async def record_model_intent(
-        self, request_id: str, *, provider_name: str, model: str, masked: bool
+        self,
+        request_id: str,
+        *,
+        provider_name: str,
+        model: str,
+        masked: bool,
+        masked_messages: list[dict[str, object]] | None = None,
     ) -> None: ...
 
     async def record_decision(
@@ -121,44 +161,89 @@ class PostgresRequestStore:
     def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
         self._sessions = sessions
 
+    @staticmethod
+    def _summary(event: AuditEvent, *, include_masked_messages: bool = False) -> AuditSummary:
+        return AuditSummary(
+            request_id=event.request_id,
+            conversation_id=event.conversation_id,
+            status=event.status,
+            policy_action=event.policy_action,
+            actual_destination=event.actual_destination,
+            simulation=event.simulation,
+            detected_categories=event.detected_categories,
+            detection_status=event.detection_status,
+            semantic_call_status=event.semantic_call_status,
+            masking_status=event.masking_status,
+            model_call_status=event.model_call_status,
+            error_code=event.error_code,
+            started_at=event.started_at,
+            finished_at=event.finished_at,
+            conversation_state_before=event.conversation_state_before,
+            conversation_state_after=event.conversation_state_after,
+            conversation_state_version=event.conversation_state_version,
+            provider_name=event.provider_name,
+            provider_model=event.provider_model,
+            detector_durations_ms=event.detector_durations_ms,
+            total_duration_ms=event.total_duration_ms,
+            masked_messages=event.masked_messages if include_masked_messages else None,
+        )
+
     async def get_audit_summary(self, request_id: str, principal_id: str) -> AuditSummary | None:
         async with self._sessions() as session:
-            row = (
-                await session.execute(
-                    select(
-                        AuditEvent.request_id,
-                        AuditEvent.conversation_id,
-                        AuditEvent.status,
-                        AuditEvent.policy_action,
-                        AuditEvent.actual_destination,
-                        AuditEvent.simulation,
-                        AuditEvent.detected_categories,
-                        AuditEvent.detection_status,
-                        AuditEvent.semantic_call_status,
-                        AuditEvent.masking_status,
-                        AuditEvent.model_call_status,
-                        AuditEvent.error_code,
-                    ).where(
-                        AuditEvent.request_id == request_id,
-                        AuditEvent.principal_id == principal_id,
-                    )
+            event = await session.scalar(
+                select(AuditEvent).where(
+                    AuditEvent.request_id == request_id, AuditEvent.principal_id == principal_id
                 )
-            ).one_or_none()
-            if row is None:
+            )
+            return self._summary(event, include_masked_messages=True) if event is not None else None
+
+    async def list_audits(
+        self,
+        principal_id: str,
+        *,
+        limit: int,
+        policy_action: str | None,
+        status: str | None,
+        conversation_id: str | None,
+        before: tuple[datetime, str] | None,
+    ) -> list[AuditSummary]:
+        statement = select(AuditEvent).where(AuditEvent.principal_id == principal_id)
+        if policy_action is not None:
+            statement = statement.where(AuditEvent.policy_action == policy_action)
+        if status is not None:
+            statement = statement.where(AuditEvent.status == status)
+        if conversation_id is not None:
+            statement = statement.where(AuditEvent.conversation_id == conversation_id)
+        if before is not None:
+            statement = statement.where(
+                or_(
+                    AuditEvent.started_at < before[0],
+                    and_(
+                        AuditEvent.started_at == before[0],
+                        AuditEvent.request_id < before[1],
+                    ),
+                )
+            )
+        statement = statement.order_by(
+            AuditEvent.started_at.desc(), AuditEvent.request_id.desc()
+        ).limit(limit)
+        async with self._sessions() as session:
+            events = (await session.scalars(statement)).all()
+            return [self._summary(event) for event in events]
+
+    async def get_conversation_summary(
+        self, conversation_id: str, principal_id: str
+    ) -> ConversationSummary | None:
+        async with self._sessions() as session:
+            conversation = await session.get(Conversation, (principal_id, conversation_id))
+            if conversation is None:
                 return None
-            return AuditSummary(
-                request_id=row.request_id,
-                conversation_id=row.conversation_id,
-                status=row.status,
-                policy_action=row.policy_action,
-                actual_destination=row.actual_destination,
-                simulation=row.simulation,
-                detected_categories=row.detected_categories,
-                detection_status=row.detection_status,
-                semantic_call_status=row.semantic_call_status,
-                masking_status=row.masking_status,
-                model_call_status=row.model_call_status,
-                error_code=row.error_code,
+            return ConversationSummary(
+                conversation_id=conversation.conversation_id,
+                state=_state(conversation),
+                state_version=conversation.state_version,
+                active_request=conversation.active_request_id is not None,
+                updated_at=conversation.updated_at,
             )
 
     @staticmethod
@@ -272,7 +357,13 @@ class PostgresRequestStore:
             event.semantic_call_status = "INTENDED"
 
     async def record_model_intent(
-        self, request_id: str, *, provider_name: str, model: str, masked: bool
+        self,
+        request_id: str,
+        *,
+        provider_name: str,
+        model: str,
+        masked: bool,
+        masked_messages: list[dict[str, object]] | None = None,
     ) -> None:
         async with self._sessions() as session, session.begin():
             _, event = await self._owned_event(session, request_id)
@@ -286,11 +377,14 @@ class PostgresRequestStore:
                 event.policy_action == "MASK_CLOUD"
             ):
                 raise RuntimeError("external model intent is invalid")
+            if masked_messages is not None and not masked:
+                raise RuntimeError("masked messages require a masked route")
             event.actual_destination = "EXTERNAL"
             event.provider_name = provider_name
             event.provider_model = model
             event.model_call_status = "INTENDED"
             event.masked = masked
+            event.masked_messages = masked_messages
             if masked:
                 event.masking_status = "SUCCEEDED"
 

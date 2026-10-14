@@ -1,4 +1,4 @@
-"""Opt-in stage 2 request and persistence check against PostgreSQL."""
+"""Request decisions and audit persistence against PostgreSQL."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ class EmptyNer:
 
 @pytest.mark.skipif(TEST_DATABASE_URL is None, reason="AEGIS_TEST_DATABASE_URL is not set")
 @pytest.mark.asyncio
-async def test_stage_two_decisions_and_audits_persist() -> None:
+async def test_decisions_and_audits_persist() -> None:
     assert TEST_DATABASE_URL is not None
     conversation_id = f"integration-{uuid4().hex}"
     blocked_id = f"integration-block-{uuid4().hex}"
@@ -145,7 +145,7 @@ async def test_stage_two_decisions_and_audits_persist() -> None:
 
 @pytest.mark.skipif(TEST_DATABASE_URL is None, reason="AEGIS_TEST_DATABASE_URL is not set")
 @pytest.mark.asyncio
-async def test_stage_four_cloud_masking_and_sensitive_state_persist() -> None:
+async def test_cloud_masking_and_sensitive_state_persist() -> None:
     assert TEST_DATABASE_URL is not None
     conversation_id = f"integration-cloud-{uuid4().hex}"
     settings = Settings(
@@ -269,7 +269,7 @@ async def test_stage_four_cloud_masking_and_sensitive_state_persist() -> None:
 
 @pytest.mark.skipif(TEST_DATABASE_URL is None, reason="AEGIS_TEST_DATABASE_URL is not set")
 @pytest.mark.asyncio
-async def test_stage_five_simulated_local_intent_and_state_persist() -> None:
+async def test_simulated_local_intent_and_state_persist() -> None:
     assert TEST_DATABASE_URL is not None
     conversation_id = f"integration-simulated-{uuid4().hex}"
     config = Settings(

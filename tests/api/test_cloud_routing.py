@@ -9,7 +9,13 @@ from typing import Any
 
 import httpx
 import pytest
-from test_gateway import (
+
+from aegis.config import Settings
+from aegis.detection import Finding, RuleDetector, TextFragment
+from aegis.main import create_app
+from aegis.policy import Category
+from aegis.provider import OpenAICompatibleCloudProvider
+from tests.support import (
     EmptyNer,
     FakeSemantic,
     MemoryStore,
@@ -18,12 +24,6 @@ from test_gateway import (
     payload,
     settings,
 )
-
-from aegis.config import Settings
-from aegis.detection import Finding, RuleDetector, TextFragment
-from aegis.main import create_app
-from aegis.policy import Category
-from aegis.provider import OpenAICompatibleCloudProvider
 
 
 def cloud(client: httpx.AsyncClient) -> OpenAICompatibleCloudProvider:
@@ -152,6 +152,7 @@ async def test_masked_history_and_tool_arguments_reach_cloud_as_placeholders() -
     event = store.events[result.headers["x-aegis-request-id"]]
     assert (event["policy_action"], event["masking_status"]) == ("MASK_CLOUD", "SUCCEEDED")
     assert (event["model_call_status"], event["masked"]) == ("SUCCEEDED", True)
+    assert event["masked_messages"] is None
     assert email not in repr(event)
 
 
@@ -288,7 +289,7 @@ async def test_provider_timeout_invalid_response_and_restore_failure_are_audited
                 return httpx.Response(200, json={"choices": []})
             token = re.search(r"\[\[AEGIS_[A-F0-9]{24}_EMAIL_001\]\]", request.content.decode())
             assert token is not None
-            return completion(token.group().replace("001", "999"))
+            return completion(token.group().replace("_EMAIL_001]]", "_EMAIL_999]]"))
 
         store = MemoryStore()
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as upstream:

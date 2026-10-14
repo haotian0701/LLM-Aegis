@@ -4,17 +4,18 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 from pydantic import ValidationError
-from test_gateway import EmptyNer, FakeSemantic, MemoryStore, auth, payload, settings
 
 from aegis.config import Settings
 from aegis.main import DEMO_PRINCIPAL, create_app
 from aegis.policy import Action, Category, PolicyEngine
 from aegis.provider import OpenAICompatibleCloudProvider, SimulatedLocalProvider
+from tests.support import EmptyNer, FakeSemantic, MemoryStore, auth, payload, settings
 
 
 def simulated_settings() -> Settings:
@@ -310,7 +311,13 @@ async def test_security_failure_never_dispatches_simulated_local(failure: str) -
 
 
 @pytest.mark.asyncio
-async def test_demo_page_bootstrap_is_loopback_only_and_token_is_process_scoped() -> None:
+async def test_demo_page_bootstrap_is_loopback_only_and_token_is_process_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "index.html").write_text(
+        '<html lang="en"><title>Decision Console</title></html>', encoding="utf-8"
+    )
+    monkeypatch.setattr("aegis.main.FRONTEND_DIST", tmp_path)
     config = settings()
     first = create_app(
         config, store=MemoryStore(), semantic_detector=FakeSemantic(), ner_detector=EmptyNer()
@@ -327,7 +334,7 @@ async def test_demo_page_bootstrap_is_loopback_only_and_token_is_process_scoped(
             "/v1/chat/completions", headers={"Authorization": f"Bearer {token}"}, json=payload()
         )
     assert page.status_code == 200
-    assert "云端模拟本地路由" in page.text
+    assert '<html lang="en">' in page.text and "Decision Console" in page.text
     assert "alice-secret-token" not in page.text
     assert bootstrap.status_code == 200
     assert bootstrap.headers["cache-control"] == "no-store"
