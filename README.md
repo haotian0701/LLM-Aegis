@@ -1,10 +1,65 @@
 # Aegis Gateway
 
-The gateway routes requests through detection, policy, providers, and a PostgreSQL audit trail. In `demo` mode, its English Decision Console lets you send requests, inspect routing results, browse audit records, and read conversation state.
+[![CI](https://github.com/haotian0701/LLM-Aegis/actions/workflows/ci.yml/badge.svg)](https://github.com/haotian0701/LLM-Aegis/actions/workflows/ci.yml)
+
+## Decision Console
+
+Screenshots from the local browser fixture using **synthetic requests and fake providers**: four policy outcomes, followed by the Audit Inspect drawer with a masked request preview.
+
+![Decision Console with four routing outcomes and audit records](assets/console-routes.png)
+
+![Audit Inspect drawer showing the MASK_CLOUD decision and masked model messages](assets/audit-inspect.png)
+
+Aegis is a Python gateway that checks an OpenAI-compatible chat request before dispatching it to a model. It combines local detection, a configurable policy, optional semantic classification, masking, provider routing, conversation state, and a PostgreSQL audit trail. The Decision Console is a loopback-only interface for exploring those decisions.
+
+The console can send single-turn requests or resend successful turns in continuous chat. It exposes routing results, a filterable audit list, an Inspect drawer, and conversation state. It is available only on loopback in `demo` mode; `strict` mode exposes neither the console nor its demo APIs.
+
+This is an engineering demo. It runs on a CPU without a local LLM; the `LOCAL` route uses Mock by default. An explicitly selected `simulated_local` route calls an **external** model. Strict mode does not load external detectors or providers and currently returns `LOCAL_UNAVAILABLE` when a trusted local model is needed.
+
+## Request flow
+
+```mermaid
+flowchart LR
+    Client["Client / local Decision Console"] --> Gateway["FastAPI: auth, limits, conversation claim"]
+    Gateway --> Detection["Local rules + spaCy NER"]
+    Detection -->|eligible demo request| Semantic["External semantic classifier: original text"]
+    Detection --> Policy["Deterministic YAML policy"]
+    Semantic --> Policy
+    Policy --> Decision{"Action"}
+    Decision -->|BLOCK| Block["403; no model call"]
+    Decision -->|LOCAL| Local["Mock or explicit simulated external model"]
+    Decision -->|CLOUD| Cloud["External model: original request"]
+    Decision -->|MASK_CLOUD| Mask["Mask + validate"] --> MaskedCloud["External model: masked request"]
+    Gateway -.-> Store[("PostgreSQL: audit + conversation state")]
+    Policy -.-> Store
+    Block -.-> Store
+    Local -.-> Store
+    Cloud -.-> Store
+    MaskedCloud -.-> Store
+```
+
+The gateway records external egress intent before an external classifier or model call. A storage, detection, masking, or provider failure does not silently switch to another route. A conversation's sensitive state persists across requests; concurrent requests for the same principal and conversation receive `409 CONVERSATION_BUSY`.
+
+| Decision | Default behavior in demo mode |
+| --- | --- |
+| `BLOCK` | Reject locally with `403 POLICY_BLOCKED`; no semantic or model call if rules already determine the block. |
+| `LOCAL` | Use Mock, or an explicitly configured external `simulated_local` provider. The audit distinguishes policy action from actual destination. |
+| `CLOUD` | Send the original request to the configured external model. |
+| `MASK_CLOUD` | Mask detected text before the model call, then restore response placeholders locally. Unsafe or unresolved masking fails closed. |
+
+The bundled policy maps API keys and secrets to `BLOCK`, business secrets to `LOCAL`, and personal or network identifiers to `MASK_CLOUD`. Customers can supply a validated YAML policy. The gateway records decision and provider metadata in PostgreSQL; demo-browser `MASK_CLOUD` audit details also retain the **masked** model-message preview. Unmasked portions of that preview remain readable. Reversible mask mappings are not stored in the audit.
+
+### Where data can leave the machine
+
+- **External semantic classifier:** In demo mode, eligible requests send their original supported message text, including history and tool-call arguments, to the configured classifier **before masking**. With no classifier configured, these requests fail with `SECURITY_UNAVAILABLE`.
+- **`CLOUD` / `MASK_CLOUD`:** The external model receives original or masked text, respectively. Mask mappings remain in request memory and are discarded after response handling.
+- **`LOCAL`:** Mock stays in process. `simulated_local` sends the original request to an external model and is labeled `actual_destination=EXTERNAL`, `simulation=true` in the audit. Strict mode does not allow that simulation.
+
+Use only synthetic messages with external demo services. [`.env.example`](.env.example) lists the optional configuration keys.
 
 ## Run locally (PowerShell)
 
-Use Python 3.13 and Docker Desktop. The install includes spaCy and its small English CPU NER model; no local LLM or GPU is needed.
+Requires Python 3.13, Node.js 24, and Docker Desktop. The included spaCy English NER model runs on a CPU. The app does not load `.env` automatically.
 
 ```powershell
 python -m venv .venv
@@ -18,105 +73,30 @@ $env:AEGIS_RUN_MODE = 'demo'
 $env:AEGIS_DEMO_PROVIDER = 'mock'
 
 .\.venv\Scripts\alembic upgrade head
-.\.venv\Scripts\python -m aegis
-```
-
-The app does not load `.env` automatically. `.env.example` lists all configuration keys. On Windows, `python -m aegis` starts Uvicorn with the Selector event loop required by psycopg's async connections.
-
-Without semantic service configuration, the gateway still starts. A request already blocked by local rules returns `POLICY_BLOCKED`; other demo requests needing semantic classification return `SECURITY_UNAVAILABLE` without calling Mock. To enable external semantic classification in demo mode, configure all three server-side values before starting the app:
-
-```powershell
-$env:AEGIS_SEMANTIC_URL = 'https://provider.example/v1/chat/completions'
-$env:AEGIS_SEMANTIC_API_KEY = 'replace-with-provider-key'
-$env:AEGIS_SEMANTIC_MODEL = 'replace-with-classifier-model'
-```
-
-Only use synthetic messages in this configuration: the classifier receives all forwarded message string fields, including history, message names, tool IDs, function names and completed tool-call arguments. The service must return a Chat Completion whose assistant `content` is JSON in the form `{"results":[{"id":"messages[0].content","label":"CLEAR"}]}`; each input text ID needs exactly one `CLEAR`, `BUSINESS_SECRET`, or `UNCERTAIN` result. An incomplete or uncertain response fails closed. Strict mode cannot configure this external detector.
-
-To send `CLOUD` and `MASK_CLOUD` model requests in demo mode, configure a separate cloud endpoint and credential. `AEGIS_CLOUD_BASE_URL` is the API root, such as `https://provider.example/v1`; Aegis appends `/chat/completions`. `AEGIS_MODEL_ALIASES_JSON` maps each client model alias to the actual cloud model ID. A partial cloud configuration prevents startup; with no cloud configuration, these routes return `ROUTE_UNAVAILABLE`.
-
-```powershell
-$env:AEGIS_CLOUD_BASE_URL = 'https://provider.example/v1'
-$env:AEGIS_CLOUD_API_KEY = 'replace-with-cloud-model-key'
-$env:AEGIS_MODEL_ALIASES_JSON = '{"aegis-demo":"replace-with-cloud-model-id"}'
-```
-
-The model route receives raw text for `CLOUD` and masked text for `MASK_CLOUD`. The external semantic classifier receives the original text first in both cases. Mask mappings stay in request memory and are discarded after response handling; they are never sent to the cloud or stored in PostgreSQL. A response containing an unresolved request placeholder fails with `SECURITY_UNAVAILABLE`.
-
-To use the configured cloud model for `LOCAL` decisions, explicitly set `AEGIS_DEMO_PROVIDER=simulated_local` instead of `mock` and restart Aegis. It reuses `AEGIS_CLOUD_BASE_URL`, `AEGIS_CLOUD_API_KEY`, and `AEGIS_MODEL_ALIASES_JSON`; incomplete cloud configuration prevents startup. This route is identified as `simulated-local-openai-compatible` in the audit, with `policy_action=LOCAL`, `actual_destination=EXTERNAL`, and `simulation=true` after model egress intent commits. Security failures and model errors do not fall back to another route.
-
-## Decision Console
-
-Install Node.js 24 LTS for frontend development. From `frontend/`, install the locked dependencies and build the English page before starting Aegis:
-
-```powershell
 cd frontend
 npm ci
-npm run typecheck
 npm run build
 cd ..
 .\.venv\Scripts\python -m aegis
 ```
 
-Open **http://127.0.0.1:8000/** in `demo` mode. The API starts without Node installed or a frontend build; if assets are missing, `/` explains which build commands to run. `strict` mode does not expose the console or demo APIs. The console fetches a process-scoped temporary token for a separate demo principal and keeps it in page memory. It never reads configured client tokens. A reload clears chat text and obtains a new temporary token.
+Open **http://127.0.0.1:8000/** on the same machine. The console obtains a temporary, process-scoped demo token. With the basic configuration above, locally blocked examples work; other requests need a semantic classifier, and external model routes need a cloud provider.
 
-For frontend development, start the Python API, then run `npm run dev` in `frontend/` and open the Vite URL. Vite proxies `/v1`, `/demo`, and `/healthz` to `127.0.0.1:8000`. The console offers **Single-turn test**, which sends only the current message, and **Continuous chat**, which resends successful turns held in current-tab memory. Both modes pass the conversation ID explicitly. The examples exercise `CLOUD`, `MASK_CLOUD`, `BLOCK`, and a follow-up `LOCAL` request using the blocked conversation ID.
-
-The audit list supports action, status, and conversation filters with signed cursor pagination and shows metadata only. The detail view shows decision state, provider identity, detection timing, and model call status. For demo-browser `MASK_CLOUD` requests, it also shows the masked messages prepared for the model; older records have no saved preview. `/demo/audits`, `/demo/audit/{request_id}`, and `/demo/conversations/{conversation_id}` require the temporary token, loopback origin and Host, and only return the demo principal's records. `masking_status=SUCCEEDED` means the gateway validated the masked request and committed model egress intent. The outbound-payload acceptance test verifies what a fake cloud model actually receives:
+To exercise all four decisions, stop the gateway, configure the optional external classifier and model services below, and start it again. Use only synthetic requests. The semantic URL points to a chat-completions endpoint; the cloud base URL is its API root, without `/chat/completions`.
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests/api/test_routing_acceptance.py tests/api/test_cloud_routing.py::test_masked_history_and_tool_arguments_reach_cloud_as_placeholders -q
+$env:AEGIS_SEMANTIC_URL = 'https://provider.example/v1/chat/completions'
+$env:AEGIS_SEMANTIC_API_KEY = 'replace-with-classifier-key'
+$env:AEGIS_SEMANTIC_MODEL = 'replace-with-classifier-model'
+$env:AEGIS_CLOUD_BASE_URL = 'https://provider.example/v1'
+$env:AEGIS_CLOUD_API_KEY = 'replace-with-model-key'
+$env:AEGIS_MODEL_ALIASES_JSON = '{"aegis-mock":"replace-with-cloud-model-id"}'
+.\.venv\Scripts\python -m aegis
 ```
 
-Completed decisions include `X-Aegis-Policy-Action`, `X-Aegis-Actual-Destination`, and `X-Aegis-Simulation` response headers. Errors before a policy decision do not include these headers.
+The classifier must return JSON with exactly one `CLEAR`, `BUSINESS_SECRET`, or `UNCERTAIN` label for every input text ID; missing or uncertain results fail closed. The optional `AEGIS_DEMO_PROVIDER=simulated_local` setting uses the configured cloud provider for `LOCAL` decisions and records the actual external destination. For frontend development, start the Python API, then run `npm run dev` in `frontend/`.
 
-Try a locally blocked synthetic request in a second PowerShell session:
-
-```powershell
-$headers = @{ Authorization = 'Bearer replace-with-a-long-random-client-token' }
-$body = @{ model = 'aegis-mock'; messages = @(@{ role = 'user'; content = 'api_key=abcdefghijklmnop12345' }) } | ConvertTo-Json -Depth 5
-$bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($body)
-Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:8000/v1/chat/completions' -Method Post -Headers $headers -ContentType 'application/json; charset=utf-8' -Body $bodyBytes
-```
-
-Send JSON as UTF-8 bytes, especially from Windows PowerShell 5.1, so non-ASCII message text reaches Aegis unchanged. Windows PowerShell 5.1 can also decode a UTF-8 response as Latin-1; for a successful response, read `$response.RawContentStream.ToArray()` with `[System.Text.Encoding]::UTF8.GetString(...)` before `ConvertFrom-Json`. The response in the example is `403 POLICY_BLOCKED`; PowerShell may surface it as a web exception. Successful or failed valid requests return `X-Aegis-Conversation-Id`. Send it explicitly on later requests to reuse a conversation; omitting it starts a new one.
-
-## Conversation ownership and administration
-
-Only one request for a given API principal and conversation ID can be active at a time. Another request receives `409 CONVERSATION_BUSY`, with both request and conversation ID headers; retry with the same conversation ID after the first request finishes. It is audited and does not reach detection or a model. Different principals can use the same text ID independently.
-
-Sensitive state never expires or downgrades automatically. An operator can close a conversation from the host after its current request finishes:
-
-```powershell
-.\.venv\Scripts\python -m aegis.admin close-conversation --principal-id demo-client --conversation-id <id> --actor <operator-id>
-```
-
-The old ID then returns `410 CONVERSATION_CLOSED` and cannot be reopened; the client must use a new ID. Closing retains prior audit records and writes an administration event. There is no public administration HTTP endpoint.
-
-If a process dies or an audit write cannot finish, its conversation may remain occupied. After confirming the original process is stopped, the operator can mark the exact pending request abandoned and release its claim:
-
-```powershell
-.\.venv\Scripts\python -m aegis.admin recover-request --principal-id demo-client --conversation-id <id> --request-id <32-character-request-id> --actor <operator-id> --confirm-stopped
-```
-
-Recovery does not clear sensitive state. If the abandoned request has no committed policy decision, recovery conservatively marks the conversation sensitive. It records `REQUEST_ABANDONED` and an administration event. A cancelled request with no committed decision is handled the same way before its claim is released. Neither claims nor sensitive state have an automatic expiry. Both commands use `AEGIS_DATABASE_URL` and must run on the host with database access.
-
-## Current decisions
-
-| Decision | Current behavior |
-| --- | --- |
-| `BLOCK` | `403 POLICY_BLOCKED`; no semantic or model call when local rules already determine the block. |
-| `LOCAL` | Demo calls the selected Mock or explicit external simulated provider; strict returns `503 LOCAL_UNAVAILABLE` without a trusted local provider. |
-| `CLOUD` | Demo calls the configured cloud model after successful detection and audit; without cloud configuration, `503 ROUTE_UNAVAILABLE`. |
-| `MASK_CLOUD` | Demo masks located entities across all supported text fields, verifies the request, calls the cloud model, then restores response placeholders. Unsafe masking returns `503 SECURITY_UNAVAILABLE` without a model call. |
-
-The bundled YAML policy maps API keys and secrets to `BLOCK`, business secrets to `LOCAL`, and detected personal or network identifiers to `MASK_CLOUD`. A custom YAML file can be selected with `AEGIS_POLICY_PATH`; invalid or incomplete policies prevent startup. The request body limit is 128 KiB, and the extracted text limit is 32 KiB. Cloud and simulated `LOCAL` requests forward `temperature`, `top_p`, and `max_tokens`; local Mock requests reject them. Strict mode continues to choose `LOCAL` because no trusted local semantic classifier is available.
-
-## CI
-
-`.github/workflows/ci.yml` checks pushes to `main` and `feat/frontend-console`, pull requests into `main`, and manual runs. It runs Python lint, formatting, typing, and unit/API tests; applies Alembic migrations and runs PostgreSQL integration tests against a temporary PostgreSQL 17 service; builds and tests the frontend; and runs the browser smoke test with fake providers. All jobs use read-only repository permissions. CI does not publish or deploy artifacts.
-
-## Check
+## Verification
 
 ```powershell
 .\.venv\Scripts\python -m pytest
@@ -125,17 +105,4 @@ The bundled YAML policy maps API keys and secrets to `BLOCK`, business secrets t
 .\.venv\Scripts\pyright
 ```
 
-Tests are grouped by dependency: `tests/unit/` covers focused components, `tests/api/` exercises the HTTP gateway with fake storage and providers, and `tests/integration/` uses PostgreSQL. Run a group with `python -m pytest tests/unit`, `python -m pytest tests/api`, or `python -m pytest tests/integration`. PostgreSQL tests require `AEGIS_TEST_DATABASE_URL` and an upgraded database; without it they are skipped. The browser fixture uses the shared fake dependencies in `tests/support.py`.
-
-Frontend checks from `frontend/`:
-
-```powershell
-npm ci
-npm run format:check
-npm run typecheck
-npm test
-npm run build
-npm run browser:smoke
-```
-
-The browser smoke command starts a local fake-provider fixture and checks the four policy examples, audit lookup, narrow layout, and keyboard activation using the installed Chrome. Set `AEGIS_CHROME` and `AEGIS_PYTHON` if those executables are at different paths.
+CI runs backend checks, PostgreSQL integration tests, frontend checks, and a browser smoke test with fake providers. Run `npm run browser:smoke` from `frontend/` to reproduce the four-route browser fixture locally.
