@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import { buildMessages, describeHttpError, routeLabel, type Message, type SendMode } from './logic'
 import styles from './App.module.css'
 
@@ -123,6 +123,54 @@ function StatusPill({ value, kind }: { value: string | null; kind?: string }) {
   return <span className={`${styles.pill} ${tone}`}>{value ?? 'Not decided'}</span>
 }
 
+function AuditDetails({ audit }: { audit: Audit }) {
+  return (
+    <div className={styles.auditDetail} aria-live="polite">
+      <div className={styles.detailHeading}>
+        <div>
+          <span className={styles.eyebrow}>SELECTED AUDIT RECORD</span>
+          <h3>{audit.request_id}</h3>
+        </div>
+        <StatusPill value={audit.policy_action} />
+      </div>
+      <div className={styles.detailGrid}>
+        <Field label="Started" value={time(audit.started_at)} />
+        <Field label="Finished" value={time(audit.finished_at)} />
+        <Field label="Conversation ID" value={audit.conversation_id} copy />
+        <Field label="Status" value={audit.status} />
+        <Field label="Policy action" value={audit.policy_action} />
+        <Field label="Actual destination" value={audit.actual_destination} />
+        <Field label="Simulation" value={audit.simulation ? 'Yes' : 'No'} />
+        <Field label="Provider" value={audit.provider_name} />
+        <Field label="Provider model" value={audit.provider_model} />
+        <Field label="Categories" value={audit.detected_categories.join(', ')} />
+        <Field label="Detection" value={audit.detection_status} />
+        <Field label="Semantic call" value={audit.semantic_call_status} />
+        <Field label="Masking" value={audit.masking_status} />
+        <Field label="Model call" value={audit.model_call_status} />
+        <Field label="State before" value={audit.conversation_state_before} />
+        <Field label="State after" value={audit.conversation_state_after} />
+        <Field label="State version" value={audit.conversation_state_version} />
+        <Field
+          label="Detection time"
+          value={
+            audit.detector_durations_ms
+              ? Object.entries(audit.detector_durations_ms)
+                  .map(([key, value]) => `${key}: ${value} ms`)
+                  .join(', ')
+              : null
+          }
+        />
+        <Field
+          label="Total time"
+          value={audit.total_duration_ms === null ? null : `${audit.total_duration_ms} ms`}
+        />
+        <Field label="Error code" value={audit.error_code} />
+      </div>
+    </div>
+  )
+}
+
 export default function App() {
   const [activeSection, setActiveSection] = useState<SectionId>(sectionFromHash)
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null)
@@ -137,6 +185,11 @@ export default function App() {
   const [result, setResult] = useState<Result | null>(null)
   const [audit, setAudit] = useState<Audit | null>(null)
   const [auditError, setAuditError] = useState('')
+  const [selectedAudit, setSelectedAudit] = useState<Audit | null>(null)
+  const [selectedAuditId, setSelectedAuditId] = useState<string | null>(null)
+  const [selectedAuditError, setSelectedAuditError] = useState('')
+  const [selectedAuditLoading, setSelectedAuditLoading] = useState(false)
+  const auditDrawerRef = useRef<HTMLDialogElement>(null)
   const [lookupId, setLookupId] = useState('')
   const [filters, setFilters] = useState<Filters>(blankFilters)
   const [appliedFilters, setAppliedFilters] = useState<Filters>(blankFilters)
@@ -187,6 +240,33 @@ export default function App() {
       setAuditError(error instanceof Error ? error.message : 'Audit lookup failed.')
     }
   }, [])
+
+  const inspectAudit = async (requestId: string) => {
+    if (!bootstrap) return
+    setLookupId(requestId)
+    setSelectedAuditId(requestId)
+    setSelectedAudit(null)
+    setSelectedAuditError('')
+    setSelectedAuditLoading(true)
+    if (!auditDrawerRef.current?.open) auditDrawerRef.current?.showModal()
+    try {
+      const response = await fetch(`/demo/audit/${encodeURIComponent(requestId)}`, {
+        headers: { Authorization: `Bearer ${bootstrap.token}` },
+        cache: 'no-store',
+      })
+      if (!response.ok)
+        throw new Error(
+          response.status === 404
+            ? 'Audit record was not found.'
+            : `Audit lookup failed (HTTP ${response.status}).`,
+        )
+      setSelectedAudit((await response.json()) as Audit)
+    } catch (error) {
+      setSelectedAuditError(error instanceof Error ? error.message : 'Audit lookup failed.')
+    } finally {
+      setSelectedAuditLoading(false)
+    }
+  }
 
   const getConversation = useCallback(async (id: string, token: string) => {
     setConversationError('')
@@ -601,7 +681,7 @@ export default function App() {
               className={styles.lookup}
               onSubmit={(event) => {
                 event.preventDefault()
-                if (bootstrap && lookupId.trim()) void getAudit(lookupId.trim(), bootstrap.token)
+                if (lookupId.trim()) void inspectAudit(lookupId.trim())
               }}
             >
               <label htmlFor="lookup">Find request ID</label>
@@ -688,7 +768,12 @@ export default function App() {
               </thead>
               <tbody>
                 {audits.map((item) => (
-                  <tr key={item.request_id}>
+                  <tr
+                    key={item.request_id}
+                    className={
+                      selectedAuditId === item.request_id ? styles.selectedAuditRow : undefined
+                    }
+                  >
                     <td>
                       <strong>{time(item.started_at)}</strong>
                       <small>{item.request_id}</small>
@@ -710,10 +795,7 @@ export default function App() {
                       <button
                         className={styles.textButton}
                         type="button"
-                        onClick={() => {
-                          setLookupId(item.request_id)
-                          if (bootstrap) void getAudit(item.request_id, bootstrap.token)
-                        }}
+                        onClick={() => void inspectAudit(item.request_id)}
                       >
                         Inspect →
                       </button>
@@ -742,57 +824,44 @@ export default function App() {
               {loadingList ? 'Loading…' : 'Load more'}
             </button>
           </div>
-          {audit && (
-            <div className={styles.auditDetail} aria-live="polite">
-              <div className={styles.detailHeading}>
-                <div>
-                  <span className={styles.eyebrow}>SELECTED AUDIT RECORD</span>
-                  <h3>{audit.request_id}</h3>
-                </div>
-                <StatusPill value={audit.policy_action} />
-              </div>
-              <div className={styles.detailGrid}>
-                <Field label="Started" value={time(audit.started_at)} />
-                <Field label="Finished" value={time(audit.finished_at)} />
-                <Field label="Conversation ID" value={audit.conversation_id} copy />
-                <Field label="Status" value={audit.status} />
-                <Field label="Policy action" value={audit.policy_action} />
-                <Field label="Actual destination" value={audit.actual_destination} />
-                <Field label="Simulation" value={audit.simulation ? 'Yes' : 'No'} />
-                <Field label="Provider" value={audit.provider_name} />
-                <Field label="Provider model" value={audit.provider_model} />
-                <Field label="Categories" value={audit.detected_categories.join(', ')} />
-                <Field label="Detection" value={audit.detection_status} />
-                <Field label="Semantic call" value={audit.semantic_call_status} />
-                <Field label="Masking" value={audit.masking_status} />
-                <Field label="Model call" value={audit.model_call_status} />
-                <Field label="State before" value={audit.conversation_state_before} />
-                <Field label="State after" value={audit.conversation_state_after} />
-                <Field label="State version" value={audit.conversation_state_version} />
-                <Field
-                  label="Detection time"
-                  value={
-                    audit.detector_durations_ms
-                      ? Object.entries(audit.detector_durations_ms)
-                          .map(([key, value]) => `${key}: ${value} ms`)
-                          .join(', ')
-                      : null
-                  }
-                />
-                <Field
-                  label="Total time"
-                  value={audit.total_duration_ms === null ? null : `${audit.total_duration_ms} ms`}
-                />
-                <Field label="Error code" value={audit.error_code} />
-              </div>
-            </div>
-          )}
           {auditError && (
             <p className={styles.inlineError} role="alert">
               {auditError}
             </p>
           )}
         </section>
+
+        <dialog
+          ref={auditDrawerRef}
+          className={styles.auditDrawer}
+          aria-labelledby="audit-drawer-title"
+          onClick={(event) => {
+            if (event.target === event.currentTarget) event.currentTarget.close()
+          }}
+        >
+          <div className={styles.auditDrawerHeader}>
+            <div>
+              <span className={styles.eyebrow}>TRACEABILITY</span>
+              <h2 id="audit-drawer-title">Audit record details</h2>
+            </div>
+            <button
+              className={styles.secondary}
+              type="button"
+              onClick={() => auditDrawerRef.current?.close()}
+            >
+              Close
+            </button>
+          </div>
+          <div className={styles.auditDrawerBody}>
+            {selectedAuditLoading && <p className={styles.muted}>Loading audit record…</p>}
+            {selectedAuditError && (
+              <p className={styles.inlineError} role="alert">
+                {selectedAuditError}
+              </p>
+            )}
+            {selectedAudit && <AuditDetails audit={selectedAudit} />}
+          </div>
+        </dialog>
 
         <section id="conversation" className={styles.panel} aria-labelledby="conversation-title">
           <div className={styles.panelHeader}>

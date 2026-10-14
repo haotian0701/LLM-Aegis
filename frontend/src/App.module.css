@@ -622,6 +622,9 @@ td {
   font-size: 11px;
   color: #52657a;
 }
+.selectedAuditRow {
+  background: #f0f6ff;
+}
 td strong {
   display: block;
   color: #35475a;
@@ -662,11 +665,51 @@ td small {
   font-size: 11px;
 }
 .auditDetail {
-  border: 1px solid #dfe8f2;
-  background: #fbfdff;
-  border-radius: 10px;
-  padding: 19px;
-  margin-top: 22px;
+  min-width: 0;
+}
+.auditDrawer[open] {
+  position: fixed;
+  inset: 0 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  width: min(540px, 100vw);
+  height: 100dvh;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 16px 0 0 16px;
+  background: #fff;
+  box-shadow: -18px 0 48px #10223933;
+  overflow: hidden;
+}
+.auditDrawer::backdrop {
+  background: #10223980;
+}
+.auditDrawerHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 22px 24px;
+  border-bottom: 1px solid #e5ebf2;
+}
+.auditDrawerHeader h2 {
+  margin: 5px 0 0;
+  font:
+    800 18px Manrope,
+    sans-serif;
+}
+.auditDrawerBody {
+  min-height: 0;
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 24px;
+}
+.auditDrawer .detailGrid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 .detailHeading {
   display: flex;
@@ -781,6 +824,17 @@ td small {
   }
 }
 @media (max-width: 560px) {
+  .auditDrawer[open] {
+    width: 100vw;
+    border-radius: 0;
+  }
+  .auditDrawerHeader,
+  .auditDrawerBody {
+    padding: 18px;
+  }
+  .auditDrawer .detailGrid {
+    grid-template-columns: 1fr;
+  }
   .sidebar {
     display: none;
   }
