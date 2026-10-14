@@ -68,6 +68,13 @@ const examples = [
 ] as const
 
 const blankFilters: Filters = { policy_action: '', status: '', conversation_id: '' }
+type SectionId = 'workspace' | 'decision' | 'audit' | 'conversation'
+const sectionIds: SectionId[] = ['workspace', 'decision', 'audit', 'conversation']
+const sectionFromHash = (): SectionId => {
+  const hash = window.location.hash.slice(1)
+  return sectionIds.find((section) => section === hash) ?? 'workspace'
+}
+
 const shown = (value: string | number | null | undefined) =>
   value === null || value === undefined || value === '' ? '—' : String(value)
 const time = (value: string | null | undefined) =>
@@ -117,6 +124,7 @@ function StatusPill({ value, kind }: { value: string | null; kind?: string }) {
 }
 
 export default function App() {
+  const [activeSection, setActiveSection] = useState<SectionId>(sectionFromHash)
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null)
   const [bootError, setBootError] = useState('')
   const [exampleError, setExampleError] = useState('')
@@ -138,6 +146,12 @@ export default function App() {
   const [loadingList, setLoadingList] = useState(false)
   const [conversation, setConversation] = useState<Conversation | null>(null)
   const [conversationError, setConversationError] = useState('')
+
+  useEffect(() => {
+    const syncSection = () => setActiveSection(sectionFromHash())
+    window.addEventListener('hashchange', syncSection)
+    return () => window.removeEventListener('hashchange', syncSection)
+  }, [])
 
   useEffect(() => {
     void fetch('/demo/bootstrap', { cache: 'no-store' })
@@ -340,16 +354,32 @@ export default function App() {
         </div>
         <div className={styles.sideSection}>WORKSPACE</div>
         <nav aria-label="Main navigation">
-          <a className={styles.navActive} href="#workspace">
+          <a
+            className={activeSection === 'workspace' ? styles.navActive : undefined}
+            href="#workspace"
+            aria-current={activeSection === 'workspace' ? 'location' : undefined}
+          >
             <span>◫</span> Request lab
           </a>
-          <a href="#decision">
+          <a
+            className={activeSection === 'decision' ? styles.navActive : undefined}
+            href="#decision"
+            aria-current={activeSection === 'decision' ? 'location' : undefined}
+          >
             <span>◈</span> Decision detail
           </a>
-          <a href="#audit">
+          <a
+            className={activeSection === 'audit' ? styles.navActive : undefined}
+            href="#audit"
+            aria-current={activeSection === 'audit' ? 'location' : undefined}
+          >
             <span>▤</span> Audit trail
           </a>
-          <a href="#conversation">
+          <a
+            className={activeSection === 'conversation' ? styles.navActive : undefined}
+            href="#conversation"
+            aria-current={activeSection === 'conversation' ? 'location' : undefined}
+          >
             <span>◎</span> Conversation
           </a>
         </nav>
