@@ -112,6 +112,10 @@ Recovery does not clear sensitive state. If the abandoned request has no committ
 
 The bundled YAML policy maps API keys and secrets to `BLOCK`, business secrets to `LOCAL`, and detected personal or network identifiers to `MASK_CLOUD`. A custom YAML file can be selected with `AEGIS_POLICY_PATH`; invalid or incomplete policies prevent startup. The request body limit is 128 KiB, and the extracted text limit is 32 KiB. Cloud and simulated `LOCAL` requests forward `temperature`, `top_p`, and `max_tokens`; local Mock requests reject them. Strict mode continues to choose `LOCAL` because no trusted local semantic classifier is available.
 
+## CI
+
+`.github/workflows/ci.yml` checks pushes to `main` and `feat/frontend-console`, pull requests into `main`, and manual runs. It runs Python lint, formatting, typing, and unit/API tests; applies Alembic migrations and runs PostgreSQL integration tests against a temporary PostgreSQL 17 service; builds and tests the frontend; and runs the browser smoke test with fake providers. All jobs use read-only repository permissions. CI does not publish or deploy artifacts.
+
 ## Check
 
 ```powershell
