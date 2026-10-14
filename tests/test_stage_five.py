@@ -327,7 +327,7 @@ async def test_demo_page_bootstrap_is_loopback_only_and_token_is_process_scoped(
             "/v1/chat/completions", headers={"Authorization": f"Bearer {token}"}, json=payload()
         )
     assert page.status_code == 200
-    assert "云端模拟本地路由" in page.text
+    assert '<html lang="en">' in page.text and "Decision Console" in page.text
     assert "alice-secret-token" not in page.text
     assert bootstrap.status_code == 200
     assert bootstrap.headers["cache-control"] == "no-store"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import json
+from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Any
 
@@ -17,7 +18,7 @@ from aegis.policy import Action, Category, PolicyEngine
 from aegis.provider import ProviderResult
 from aegis.schemas import ChatRequest
 from aegis.semantic import OpenAICompatibleSemanticDetector
-from aegis.store import AuditDraft, AuditSummary, BeginResult
+from aegis.store import AuditDraft, AuditSummary, BeginResult, ConversationSummary
 
 HMAC_KEY = "test-hmac-key-longer-than-thirty-two-bytes"
 DB_URL = "postgresql+psycopg://unused:unused@localhost/unused"
@@ -53,6 +54,61 @@ class MemoryStore:
             masking_status=event.get("masking_status"),
             model_call_status=event.get("model_call_status"),
             error_code=event.get("error_code"),
+            started_at=event.get("started_at"),
+            finished_at=event.get("finished_at"),
+            conversation_state_before=event.get("conversation_state_before"),
+            conversation_state_after=event.get("conversation_state_after"),
+            conversation_state_version=event.get("conversation_state_version"),
+            provider_name=event.get("provider_name"),
+            provider_model=event.get("provider_model"),
+            detector_durations_ms=event.get("detector_durations_ms"),
+            total_duration_ms=event.get("total_duration_ms"),
+        )
+
+    async def list_audits(
+        self,
+        principal_id: str,
+        *,
+        limit: int,
+        policy_action: str | None,
+        status: str | None,
+        conversation_id: str | None,
+        before: tuple[datetime, str] | None,
+    ) -> list[AuditSummary]:
+        events = [
+            event
+            for event in self.events.values()
+            if event["principal_id"] == principal_id
+            and (policy_action is None or event["policy_action"] == policy_action)
+            and (status is None or event["status"] == status)
+            and (conversation_id is None or event["conversation_id"] == conversation_id)
+        ]
+        events.sort(key=lambda event: (event["started_at"], event["request_id"]), reverse=True)
+        if before is not None:
+            events = [
+                event for event in events if (event["started_at"], event["request_id"]) < before
+            ]
+        summaries = [
+            await self.get_audit_summary(event["request_id"], principal_id)
+            for event in events[:limit]
+        ]
+        return [summary for summary in summaries if summary is not None]
+
+    async def get_conversation_summary(
+        self, conversation_id: str, principal_id: str
+    ) -> ConversationSummary | None:
+        key = (principal_id, conversation_id)
+        if key not in self.conversations:
+            return None
+        state = (
+            "CLOSED" if key in self.closed else "SENSITIVE" if self.conversations[key] else "NORMAL"
+        )
+        return ConversationSummary(
+            conversation_id=conversation_id,
+            state=state,
+            state_version=self.versions[key],
+            active_request=key in self.active,
+            updated_at=datetime.now(UTC),
         )
 
     async def record_rejection(self, draft: AuditDraft) -> None:
@@ -62,6 +118,7 @@ class MemoryStore:
             "actual_destination": "NONE",
             "detected_categories": [],
             "detection_status": "NOT_RUN",
+            "started_at": datetime.now(UTC),
         }
 
     async def begin_request(self, draft: AuditDraft) -> BeginResult:
@@ -85,6 +142,7 @@ class MemoryStore:
             "conversation_state_before": state,
             "conversation_state_after": None,
             "conversation_state_version": self.versions[key],
+            "started_at": datetime.now(UTC),
         }
         if key in self.closed:
             self.events[draft.request_id].update(
@@ -204,6 +262,7 @@ class MemoryStore:
         key = (event["principal_id"], event["conversation_id"])
         assert self.active[key] == request_id
         event.update(status=status, error_code=error_code, total_duration_ms=duration_ms)
+        event["finished_at"] = datetime.now(UTC)
         if event["conversation_state_after"] is None:
             event["conversation_state_after"] = event["conversation_state_before"]
         if detection_status is not None:

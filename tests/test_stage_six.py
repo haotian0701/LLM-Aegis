@@ -149,7 +149,7 @@ async def test_demo_audit_lookup_is_scoped_to_process_token_and_principal() -> N
         base_url="http://127.0.0.1",
     ) as client:
         page = await client.get("/")
-        assert "按请求 ID 查看本页审计" in page.text
+        assert "Aegis" in page.text
         token = (await client.get("/demo/bootstrap")).json()["token"]
         demo_headers = {"Authorization": f"Bearer {token}"}
         masked = await client.post(
