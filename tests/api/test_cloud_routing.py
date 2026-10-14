@@ -289,7 +289,7 @@ async def test_provider_timeout_invalid_response_and_restore_failure_are_audited
                 return httpx.Response(200, json={"choices": []})
             token = re.search(r"\[\[AEGIS_[A-F0-9]{24}_EMAIL_001\]\]", request.content.decode())
             assert token is not None
-            return completion(token.group().replace("001", "999"))
+            return completion(token.group().replace("_EMAIL_001]]", "_EMAIL_999]]"))
 
         store = MemoryStore()
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as upstream:
