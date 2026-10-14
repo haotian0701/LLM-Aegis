@@ -31,6 +31,7 @@ try {
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } })
   await page.goto(url)
   await page.getByRole('heading', { name: 'Decision Console' }).waitFor()
+  const drawer = page.getByRole('dialog', { name: 'Audit record details' })
   for (const [sample, result] of [
     ['Expected CLOUD decision', 'Cloud route'],
     ['Expected MASK_CLOUD decision', 'Masked cloud route'],
@@ -46,6 +47,14 @@ try {
         .getByText(/Request ID/)
         .isVisible(),
     )
+    if (sample === 'Expected MASK_CLOUD decision') {
+      await page.getByRole('button', { name: 'Find', exact: true }).click()
+      const preview = drawer.getByRole('region', { name: 'Masked model messages' })
+      await preview.getByText('Masked messages prepared for model').waitFor()
+      assert.match(await preview.locator('pre').innerText(), /\[\[AEGIS_[A-F0-9]{24}_EMAIL_001\]\]/)
+      assert.doesNotMatch(await preview.locator('pre').innerText(), /demo\.user@example\.com/)
+      await drawer.getByRole('button', { name: 'Close' }).click()
+    }
   }
   const blockedConversationId = await page.locator('#conversation-lookup').inputValue()
   await page.locator('#conversation').getByText('SENSITIVE', { exact: true }).first().waitFor()
@@ -56,7 +65,6 @@ try {
   await page.getByText('SENSITIVE', { exact: true }).first().waitFor()
   const requestId = await page.locator('#lookup').inputValue()
   assert.match(requestId, /^[0-9a-f]{32}$/)
-  const drawer = page.getByRole('dialog', { name: 'Audit record details' })
   await page.getByRole('button', { name: 'Find', exact: true }).click()
   await drawer.getByText('SELECTED AUDIT RECORD').waitFor()
   assert.ok((await drawer.boundingBox()).x > 800)

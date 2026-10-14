@@ -738,6 +738,14 @@ def create_app(
                                 provider_name=cloud_provider.name,
                                 model=settings.model_aliases[chat_request.model],
                                 masked=masked_request is not None,
+                                masked_messages=(
+                                    [
+                                        message.model_dump(exclude_none=True)
+                                        for message in outbound.messages
+                                    ]
+                                    if masked_request is not None and principal_id == DEMO_PRINCIPAL
+                                    else None
+                                ),
                             )
                         except Exception:
                             return _route_headers(

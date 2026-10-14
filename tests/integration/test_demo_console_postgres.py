@@ -44,15 +44,22 @@ async def test_postgres_audit_cursor_and_principal_isolation() -> None:
                         conversation_id=conversation_id,
                         started_at=now,
                         status="BLOCKED" if index == 2 else "SUCCEEDED",
-                        policy_action="BLOCK" if index == 2 else "CLOUD",
+                        policy_action=(
+                            "BLOCK" if index == 2 else "MASK_CLOUD" if index == 0 else "CLOUD"
+                        ),
                         actual_destination="NONE",
                         simulation=False,
                         blocked=index == 2,
-                        masked=False,
+                        masked=index == 0,
                         detected_categories=[],
                         detection_status="SUCCEEDED",
                         detector_durations_ms={},
                         prompt_hmac="a" * 64,
+                        masked_messages=(
+                            [{"role": "user", "content": "Hello [[AEGIS_EMAIL_001]]"}]
+                            if index == 0
+                            else None
+                        ),
                     )
                 )
             session.add(
@@ -125,6 +132,11 @@ async def test_postgres_audit_cursor_and_principal_isolation() -> None:
                 )
             ).status_code == 400
             assert "prompt_hmac" not in str(first)
+            assert all(item["masked_messages"] is None for item in first["items"])
+            detail = await client.get(f"/demo/audit/{own_ids[0]}", headers=headers)
+            assert detail.json()["masked_messages"] == [
+                {"role": "user", "content": "Hello [[AEGIS_EMAIL_001]]"}
+            ]
             assert (await client.get(f"/demo/audit/{other_id}", headers=headers)).status_code == 404
             conversation = await client.get(
                 f"/demo/conversations/{conversation_id}", headers=headers

@@ -667,6 +667,35 @@ td small {
 .auditDetail {
   min-width: 0;
 }
+.maskedPreview {
+  margin-top: 24px;
+  min-width: 0;
+}
+.maskedPreview h4 {
+  margin: 0 0 10px;
+  font-size: 13px;
+}
+.maskedPreview pre {
+  margin: 0;
+  padding: 14px;
+  overflow-x: auto;
+  border: 1px solid #e5ebf2;
+  border-radius: 10px;
+  background: #f6f8fb;
+  color: #334155;
+  font:
+    12px/1.6 ui-monospace,
+    SFMono-Regular,
+    Consolas,
+    monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.maskedPreview p {
+  margin: 0;
+  color: #64748b;
+  font-size: 12px;
+}
 .auditDrawer[open] {
   position: fixed;
   inset: 0 0 0 auto;

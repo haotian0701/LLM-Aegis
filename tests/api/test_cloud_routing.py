@@ -152,6 +152,7 @@ async def test_masked_history_and_tool_arguments_reach_cloud_as_placeholders() -
     event = store.events[result.headers["x-aegis-request-id"]]
     assert (event["policy_action"], event["masking_status"]) == ("MASK_CLOUD", "SUCCEEDED")
     assert (event["model_call_status"], event["masked"]) == ("SUCCEEDED", True)
+    assert event["masked_messages"] is None
     assert email not in repr(event)
 
 

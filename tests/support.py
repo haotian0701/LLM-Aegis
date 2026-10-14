@@ -57,6 +57,7 @@ class MemoryStore:
             provider_model=event.get("provider_model"),
             detector_durations_ms=event.get("detector_durations_ms"),
             total_duration_ms=event.get("total_duration_ms"),
+            masked_messages=event.get("masked_messages"),
         )
 
     async def list_audits(
@@ -86,7 +87,11 @@ class MemoryStore:
             await self.get_audit_summary(event["request_id"], principal_id)
             for event in events[:limit]
         ]
-        return [summary for summary in summaries if summary is not None]
+        return [
+            AuditSummary(**{**vars(summary), "masked_messages": None})
+            for summary in summaries
+            if summary is not None
+        ]
 
     async def get_conversation_summary(
         self, conversation_id: str, principal_id: str
@@ -173,7 +178,13 @@ class MemoryStore:
         )
 
     async def record_model_intent(
-        self, request_id: str, *, provider_name: str, model: str, masked: bool
+        self,
+        request_id: str,
+        *,
+        provider_name: str,
+        model: str,
+        masked: bool,
+        masked_messages: list[dict[str, object]] | None = None,
     ) -> None:
         if self.fail_model_intent:
             raise RuntimeError("database unavailable")
@@ -183,6 +194,7 @@ class MemoryStore:
             event["policy_action"] == "LOCAL" and event["simulation"]
         )
         assert masked == (event["policy_action"] == "MASK_CLOUD")
+        assert masked_messages is None or masked
         event.update(
             actual_destination="EXTERNAL",
             provider_name=provider_name,
@@ -190,6 +202,7 @@ class MemoryStore:
             model_call_status="INTENDED",
             masked=masked,
             masking_status="SUCCEEDED" if masked else None,
+            masked_messages=masked_messages,
         )
 
     async def record_decision(

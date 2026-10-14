@@ -118,6 +118,9 @@ async def test_acceptance_matrix_inspects_actual_model_request(
     assert summary["detected_categories"] == categories, name
     assert summary["masking_status"] == audit["masking_status"], name
     assert summary["model_call_status"] == audit["model_call_status"], name
+    assert summary["masked_messages"] == (outbound[0]["messages"] if sent == "MASKED" else None), (
+        name
+    )
     assert "prompt_hmac" not in summary and message not in summary_response.text, name
     assert audit["masking_status"] == ("SUCCEEDED" if sent == "MASKED" else None), name
     assert audit["model_call_status"] == ("SUCCEEDED" if sent != "NONE" else None), name

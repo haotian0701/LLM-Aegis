@@ -55,6 +55,7 @@ class AuditSummary:
     provider_model: str | None = None
     detector_durations_ms: dict[str, int] | None = None
     total_duration_ms: int | None = None
+    masked_messages: list[dict[str, object]] | None = None
 
 
 @dataclass(frozen=True)
@@ -113,7 +114,13 @@ class RequestStore(Protocol):
     ) -> None: ...
 
     async def record_model_intent(
-        self, request_id: str, *, provider_name: str, model: str, masked: bool
+        self,
+        request_id: str,
+        *,
+        provider_name: str,
+        model: str,
+        masked: bool,
+        masked_messages: list[dict[str, object]] | None = None,
     ) -> None: ...
 
     async def record_decision(
@@ -155,7 +162,7 @@ class PostgresRequestStore:
         self._sessions = sessions
 
     @staticmethod
-    def _summary(event: AuditEvent) -> AuditSummary:
+    def _summary(event: AuditEvent, *, include_masked_messages: bool = False) -> AuditSummary:
         return AuditSummary(
             request_id=event.request_id,
             conversation_id=event.conversation_id,
@@ -178,6 +185,7 @@ class PostgresRequestStore:
             provider_model=event.provider_model,
             detector_durations_ms=event.detector_durations_ms,
             total_duration_ms=event.total_duration_ms,
+            masked_messages=event.masked_messages if include_masked_messages else None,
         )
 
     async def get_audit_summary(self, request_id: str, principal_id: str) -> AuditSummary | None:
@@ -187,7 +195,7 @@ class PostgresRequestStore:
                     AuditEvent.request_id == request_id, AuditEvent.principal_id == principal_id
                 )
             )
-            return self._summary(event) if event is not None else None
+            return self._summary(event, include_masked_messages=True) if event is not None else None
 
     async def list_audits(
         self,
@@ -349,7 +357,13 @@ class PostgresRequestStore:
             event.semantic_call_status = "INTENDED"
 
     async def record_model_intent(
-        self, request_id: str, *, provider_name: str, model: str, masked: bool
+        self,
+        request_id: str,
+        *,
+        provider_name: str,
+        model: str,
+        masked: bool,
+        masked_messages: list[dict[str, object]] | None = None,
     ) -> None:
         async with self._sessions() as session, session.begin():
             _, event = await self._owned_event(session, request_id)
@@ -363,11 +377,14 @@ class PostgresRequestStore:
                 event.policy_action == "MASK_CLOUD"
             ):
                 raise RuntimeError("external model intent is invalid")
+            if masked_messages is not None and not masked:
+                raise RuntimeError("masked messages require a masked route")
             event.actual_destination = "EXTERNAL"
             event.provider_name = provider_name
             event.provider_model = model
             event.model_call_status = "INTENDED"
             event.masked = masked
+            event.masked_messages = masked_messages
             if masked:
                 event.masking_status = "SUCCEEDED"
 

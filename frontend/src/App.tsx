@@ -25,6 +25,7 @@ type Audit = {
   provider_model: string | null
   detector_durations_ms: Record<string, number> | null
   total_duration_ms: number | null
+  masked_messages: Array<Record<string, unknown>> | null
 }
 type Conversation = {
   conversation_id: string
@@ -167,6 +168,16 @@ function AuditDetails({ audit }: { audit: Audit }) {
         />
         <Field label="Error code" value={audit.error_code} />
       </div>
+      {audit.policy_action === 'MASK_CLOUD' && (
+        <section className={styles.maskedPreview} aria-label="Masked model messages">
+          <h4>Masked messages prepared for model</h4>
+          {audit.masked_messages ? (
+            <pre>{JSON.stringify(audit.masked_messages, null, 2)}</pre>
+          ) : (
+            <p>No saved masked messages for this record.</p>
+          )}
+        </section>
+      )}
     </div>
   )
 }
@@ -674,7 +685,7 @@ export default function App() {
               <span className={styles.eyebrow}>03 / TRACEABILITY</span>
               <h2 id="audit-title">Audit trail</h2>
             </div>
-            <span className={styles.muted}>Metadata only</span>
+            <span className={styles.muted}>Masked preview in details</span>
           </div>
           <div className={styles.auditToolbar}>
             <form

@@ -88,6 +88,7 @@ class AuditEvent(Base):
     blocked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     masked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     prompt_hmac: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    masked_messages: Mapped[list[dict[str, object]] | None] = mapped_column(JSONB, nullable=True)
     detector_durations_ms: Mapped[dict[str, int]] = mapped_column(
         JSONB, nullable=False, default=dict
     )
