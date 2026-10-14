@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -310,7 +311,13 @@ async def test_security_failure_never_dispatches_simulated_local(failure: str) -
 
 
 @pytest.mark.asyncio
-async def test_demo_page_bootstrap_is_loopback_only_and_token_is_process_scoped() -> None:
+async def test_demo_page_bootstrap_is_loopback_only_and_token_is_process_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "index.html").write_text(
+        '<html lang="en"><title>Decision Console</title></html>', encoding="utf-8"
+    )
+    monkeypatch.setattr("aegis.main.FRONTEND_DIST", tmp_path)
     config = settings()
     first = create_app(
         config, store=MemoryStore(), semantic_detector=FakeSemantic(), ner_detector=EmptyNer()
