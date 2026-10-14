@@ -5,7 +5,7 @@ import { chromium } from 'playwright'
 const url = 'http://127.0.0.1:8765/'
 const python = process.env.AEGIS_PYTHON ?? '.venv/Scripts/python.exe'
 const chrome = process.env.AEGIS_CHROME ?? 'C:/Program Files/Google/Chrome/Application/chrome.exe'
-const server = spawn(python, ['tests/browser_demo_server.py'], {
+const server = spawn(python, ['-m', 'tests.api.browser_demo_server'], {
   cwd: '..',
   stdio: 'ignore',
   windowsHide: true,

@@ -9,7 +9,13 @@ from typing import Any
 
 import httpx
 import pytest
-from test_gateway import (
+
+from aegis.config import Settings
+from aegis.detection import Finding, RuleDetector, TextFragment
+from aegis.main import create_app
+from aegis.policy import Category
+from aegis.provider import OpenAICompatibleCloudProvider
+from tests.support import (
     EmptyNer,
     FakeSemantic,
     MemoryStore,
@@ -18,12 +24,6 @@ from test_gateway import (
     payload,
     settings,
 )
-
-from aegis.config import Settings
-from aegis.detection import Finding, RuleDetector, TextFragment
-from aegis.main import create_app
-from aegis.policy import Category
-from aegis.provider import OpenAICompatibleCloudProvider
 
 
 def cloud(client: httpx.AsyncClient) -> OpenAICompatibleCloudProvider:

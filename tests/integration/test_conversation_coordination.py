@@ -1,4 +1,4 @@
-"""Stage 3 coordination and administration against PostgreSQL."""
+"""Conversation coordination and administration against PostgreSQL."""
 
 from __future__ import annotations
 

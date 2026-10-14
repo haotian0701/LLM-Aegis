@@ -65,7 +65,7 @@ For frontend development, start the Python API, then run `npm run dev` in `front
 The audit list supports action, status, and conversation filters with signed cursor pagination. The detail view shows decision state, provider identity, detection timing, and model call status. `/demo/audits`, `/demo/audit/{request_id}`, and `/demo/conversations/{conversation_id}` require the temporary token, loopback origin and Host, and only return the demo principal's metadata. `masking_status=SUCCEEDED` means the gateway validated the masked request and committed model egress intent. The outbound-payload acceptance test verifies what a fake cloud model actually receives:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests/test_stage_six.py tests/test_cloud_routing.py::test_masked_history_and_tool_arguments_reach_cloud_as_placeholders -q
+.\.venv\Scripts\python.exe -m pytest tests/api/test_routing_acceptance.py tests/api/test_cloud_routing.py::test_masked_history_and_tool_arguments_reach_cloud_as_placeholders -q
 ```
 
 Completed decisions include `X-Aegis-Policy-Action`, `X-Aegis-Actual-Destination`, and `X-Aegis-Simulation` response headers. Errors before a policy decision do not include these headers.
@@ -121,7 +121,7 @@ The bundled YAML policy maps API keys and secrets to `BLOCK`, business secrets t
 .\.venv\Scripts\pyright
 ```
 
-The HTTP tests use a fake store and fake semantic HTTP service. To run the PostgreSQL integration test after `alembic upgrade head`, set `AEGIS_TEST_DATABASE_URL` to the same PostgreSQL URL and rerun pytest.
+Tests are grouped by dependency: `tests/unit/` covers focused components, `tests/api/` exercises the HTTP gateway with fake storage and providers, and `tests/integration/` uses PostgreSQL. Run a group with `python -m pytest tests/unit`, `python -m pytest tests/api`, or `python -m pytest tests/integration`. PostgreSQL tests require `AEGIS_TEST_DATABASE_URL` and an upgraded database; without it they are skipped. The browser fixture uses the shared fake dependencies in `tests/support.py`.
 
 Frontend checks from `frontend/`:
 

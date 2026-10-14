@@ -7,10 +7,10 @@ from typing import Any
 
 import httpx
 import pytest
-from test_gateway import EmptyNer, FakeSemantic, MemoryStore, auth, payload, settings
 
 from aegis.main import create_app
 from aegis.provider import OpenAICompatibleCloudProvider, SimulatedLocalProvider
+from tests.support import EmptyNer, FakeSemantic, MemoryStore, auth, payload, settings
 
 
 @pytest.mark.parametrize(

@@ -9,12 +9,12 @@ from typing import Any
 import httpx
 import pytest
 from pydantic import ValidationError
-from test_gateway import EmptyNer, FakeSemantic, MemoryStore, auth, payload, settings
 
 from aegis.config import Settings
 from aegis.main import DEMO_PRINCIPAL, create_app
 from aegis.policy import Action, Category, PolicyEngine
 from aegis.provider import OpenAICompatibleCloudProvider, SimulatedLocalProvider
+from tests.support import EmptyNer, FakeSemantic, MemoryStore, auth, payload, settings
 
 
 def simulated_settings() -> Settings:

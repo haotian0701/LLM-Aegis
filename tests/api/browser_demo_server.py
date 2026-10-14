@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import uvicorn
-from test_gateway import EmptyNer, FakeSemantic, MemoryStore, settings
 
 from aegis.main import create_app
 from aegis.provider import ProviderResult
+from tests.support import EmptyNer, FakeSemantic, MemoryStore, settings
 
 
 class BrowserModel:
