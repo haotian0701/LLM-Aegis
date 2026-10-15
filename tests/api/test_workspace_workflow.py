@@ -35,6 +35,19 @@ class Model:
         return AgentTurn(content="Routing is described in README.md:1.")
 
 
+class AnswerWithoutTool:
+    name = "answer-without-tool"
+    destination = "EXTERNAL"
+    simulation = False
+
+    def __init__(self) -> None:
+        self.requests: list[Any] = []
+
+    async def next_turn(self, request: Any) -> AgentTurn:
+        self.requests.append(request)
+        return AgentTurn(content="Routing is described in README.md:1.")
+
+
 class Screen:
     async def classify(self, text: str) -> Literal["CLEAR", "INJECTION", "UNCERTAIN"]:
         return "INJECTION" if "ignore prior instructions" in text else "CLEAR"
@@ -89,7 +102,7 @@ def test_keyword_search_and_large_file_window(repo: Path) -> None:
 def app(
     repo: Path,
     store: MemoryStore,
-    model: Model,
+    model: Any,
     semantic: FakeSemantic | None = None,
     ner: Any = None,
 ) -> Any:
@@ -139,19 +152,53 @@ async def test_real_tracked_file_is_read_and_sent_to_model(repo: Path) -> None:
         body = response.json()
         assert body["status"] == "COMPLETED"
         assert body["sources"][0]["source"] == "README.md"
-        assert "routing is audited" in model.requests[1].messages[-1].content
-        assert "do-not-read" not in model.requests[1].messages[-1].content
+        assert "routing is audited" in model.requests[0].messages[-1].content
+        assert "do-not-read" not in model.requests[0].messages[-1].content
         assert semantic.calls
         assert all(fragment.message_index != 0 for call in semantic.calls for fragment in call)
         assert any(fragment.path == "messages[1].content" for fragment in semantic.calls[0])
-        assert all(fragment.message_index != 3 for call in ner.calls for fragment in call)
+        assert all(fragment.message_index == 1 for call in ner.calls for fragment in call)
         detail = await client.get(
             f"/demo/audit/{body['task_id']}",
             headers={"Authorization": f"Bearer {demo_token}"},
         )
         steps = detail.json()["steps"]
         assert any(step["kind"] == "TOOL_CALL" and step["executed"] for step in steps)
+        assert steps[0]["source"] == "workspace-planner"
         assert any(step["kind"] == "RETRIEVAL" and step["decision"] == "INCLUDE" for step in steps)
+
+
+@pytest.mark.asyncio
+async def test_model_can_answer_after_planned_search_without_calling_tool(repo: Path) -> None:
+    store = MemoryStore()
+    model = AnswerWithoutTool()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app(repo, store, model)),
+        base_url="http://127.0.0.1",
+    ) as client:
+        demo_token = await token(client)
+        response = await client.post(
+            "/v1/workflows/workspace",
+            headers={"Authorization": f"Bearer {demo_token}"},
+            json={"model": "aegis-mock", "input": "Where is routing described?"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "COMPLETED"
+        assert response.json()["sources"][0]["source"] == "README.md"
+        assert len(model.requests) == 1
+        assert "README.md:1: routing is audited" in model.requests[0].messages[-1].content
+        detail = await client.get(
+            f"/demo/audit/{response.json()['task_id']}",
+            headers={"Authorization": f"Bearer {demo_token}"},
+        )
+        steps = detail.json()["steps"]
+        assert any(
+            step["kind"] == "TOOL_CALL"
+            and step["source"] == "workspace-planner"
+            and step["executed"] is True
+            for step in steps
+        )
+        assert not any(step["source"] == "agent-model" for step in steps)
 
 
 @pytest.mark.asyncio
@@ -206,7 +253,7 @@ async def test_injected_file_stays_out_of_model_context(repo: Path) -> None:
         )
         assert response.status_code == 200
         assert response.json()["status"] == "SOURCE_EXCLUDED"
-        assert len(model.requests) == 1
+        assert model.requests == []
         detail = await client.get(
             f"/demo/audit/{response.json()['task_id']}",
             headers={"Authorization": f"Bearer {demo_token}"},
@@ -246,7 +293,7 @@ async def test_local_secret_check_prevents_external_screening(repo: Path) -> Non
             step["kind"] == "SEMANTIC_CHECK" and step["source"] == "workspace-tool"
             for step in steps
         )
-        assert len(model.requests) == 1
+        assert model.requests == []
 
 
 @pytest.mark.asyncio
@@ -290,7 +337,9 @@ async def test_uncertain_classifier_has_explicit_reason_and_stops_model(repo: Pa
             f"/demo/audit/{response.headers['X-Aegis-Request-Id']}",
             headers={"Authorization": f"Bearer {demo_token}"},
         )
-        assert detail.json()["steps"][0]["error_code"] == "SEMANTIC_UNCERTAIN"
+        assert any(
+            step["error_code"] == "SEMANTIC_UNCERTAIN" for step in detail.json()["steps"]
+        )
 
 
 @pytest.mark.asyncio

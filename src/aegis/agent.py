@@ -174,7 +174,7 @@ class AgentService:
         was_sensitive: bool,
         *,
         trusted_system: bool = False,
-        skip_tool_ner: bool = False,
+        user_only_ner: bool = False,
     ) -> tuple[str | None, ProposedToolCall | None, bool]:
         request = ChatRequest(model=model_alias, messages=messages)
         all_fragments = extract_fragments(request)
@@ -197,9 +197,9 @@ class AgentService:
                     [
                         fragment
                         for fragment in fragments
-                        if messages[fragment.message_index].role != "tool"
+                        if messages[fragment.message_index].role == "user"
                     ]
-                    if skip_tool_ner
+                    if user_only_ner
                     else fragments
                 )
                 findings.extend(await self.ner_detector.detect(ner_fragments))
