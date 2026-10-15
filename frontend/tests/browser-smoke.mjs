@@ -37,6 +37,7 @@ try {
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } })
   await page.goto(url)
   await page.getByRole('heading', { name: 'Decision Console' }).waitFor()
+  assert.equal(await page.getByRole('checkbox', { name: /Use project files/ }).count(), 0)
   const drawer = page.getByRole('dialog', { name: 'Audit record details' })
   for (const [sample, result] of [
     ['Expected CLOUD decision', 'Cloud route'],

@@ -3,6 +3,8 @@ import { buildMessages, describeHttpError, routeLabel, type Message, type SendMo
 import styles from './App.module.css'
 
 type Bootstrap = { token: string; models: string[]; local_mode: string }
+type WorkspaceBootstrap = { token: string; models: string[]; root: string }
+type Source = { source: string; version: string }
 type AuditStep = {
   step_id: string
   sequence: number
@@ -55,6 +57,7 @@ type Conversation = {
   updated_at: string | null
 }
 type Result = {
+  kind: 'CHAT' | 'AGENT'
   httpStatus: number
   content: string | null
   code: string | null
@@ -63,6 +66,8 @@ type Result = {
   action: string | null
   destination: string
   simulation: boolean
+  workflowStatus: string | null
+  sources: Source[]
 }
 type Filters = { policy_action: string; status: string; conversation_id: string }
 
@@ -237,9 +242,11 @@ function AuditDetails({ audit }: { audit: Audit }) {
 export default function App() {
   const [activeSection, setActiveSection] = useState<SectionId>(sectionFromHash)
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null)
+  const [workspace, setWorkspace] = useState<WorkspaceBootstrap | null>(null)
   const [bootError, setBootError] = useState('')
   const [exampleError, setExampleError] = useState('')
   const [mode, setMode] = useState<SendMode>('single')
+  const [useProjectFiles, setUseProjectFiles] = useState(false)
   const [model, setModel] = useState('')
   const [text, setText] = useState('')
   const [conversationId, setConversationId] = useState('')
@@ -270,6 +277,14 @@ export default function App() {
   }, [])
 
   useEffect(() => {
+    void fetch('/workspace/bootstrap', { cache: 'no-store' })
+      .then(async (response) => {
+        if (response.ok) setWorkspace((await response.json()) as WorkspaceBootstrap)
+      })
+      .catch(() => undefined)
+  }, [])
+
+  useEffect(() => {
     void fetch('/demo/bootstrap', { cache: 'no-store' })
       .then(async (response) => {
         if (!response.ok) throw new Error('Demo bootstrap is unavailable.')
@@ -297,10 +312,13 @@ export default function App() {
             ? 'Audit record was not found.'
             : `Audit lookup failed (HTTP ${response.status}).`,
         )
-      setAudit((await response.json()) as Audit)
+      const detail = (await response.json()) as Audit
+      setAudit(detail)
+      return detail
     } catch (error) {
       setAudit(null)
       setAuditError(error instanceof Error ? error.message : 'Audit lookup failed.')
+      return null
     }
   }, [])
 
@@ -379,8 +397,12 @@ export default function App() {
     if (bootstrap) void loadAudits(bootstrap.token, appliedFilters)
   }, [bootstrap, appliedFilters, loadAudits])
 
-  const messages = useMemo(() => buildMessages(mode, history, text.trim()), [mode, history, text])
+  const messages = useMemo(
+    () => buildMessages(useProjectFiles ? 'single' : mode, history, text.trim()),
+    [useProjectFiles, mode, history, text],
+  )
   const chooseExample = (key: string, sample: string) => {
+    setUseProjectFiles(false)
     if (
       key === 'LOCAL' &&
       (!conversationId ||
@@ -398,6 +420,7 @@ export default function App() {
     document.getElementById('message')?.focus()
   }
   const startNew = () => {
+    setUseProjectFiles(false)
     setConversationId('')
     setHistory([])
     setResult(null)
@@ -415,12 +438,65 @@ export default function App() {
   }
   const send = async (event: FormEvent) => {
     event.preventDefault()
-    if (!bootstrap || !model || !text.trim() || sending) return
+    if (!bootstrap || !model || !text.trim() || sending || (useProjectFiles && !workspace)) return
     setSending(true)
     setAudit(null)
     setAuditError('')
     const input = text.trim()
     try {
+      if (useProjectFiles) {
+        const headers: Record<string, string> = {
+          Authorization: `Bearer ${bootstrap.token}`,
+          'Content-Type': 'application/json',
+        }
+        if (conversationId.trim()) headers['X-Aegis-Conversation-Id'] = conversationId.trim()
+        const response = await fetch('/v1/workflows/workspace', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ model, input }),
+        })
+        const body = await response.json()
+        const requestId = response.headers.get('X-Aegis-Request-Id') ?? body?.task_id ?? null
+        const returnedId = response.headers.get('X-Aegis-Conversation-Id')
+        const code: string | null = body?.error?.code ?? null
+        setResult({
+          kind: 'AGENT',
+          httpStatus: response.status,
+          content: response.ok
+            ? (body?.answer ?? null)
+            : (body?.error?.message ?? describeHttpError(response.status, code)),
+          code,
+          requestId,
+          conversationId: returnedId,
+          action: null,
+          destination: 'NONE',
+          simulation: false,
+          workflowStatus: response.ok ? (body?.status ?? null) : null,
+          sources: response.ok && Array.isArray(body?.sources) ? body.sources : [],
+        })
+        if (returnedId) setConversationId(returnedId)
+        if (response.ok) setText('')
+        if (requestId) {
+          setLookupId(requestId)
+          const detail = await getAudit(requestId, bootstrap.token)
+          if (detail) {
+            setResult((previous) =>
+              previous && previous.requestId === requestId
+                ? {
+                    ...previous,
+                    action: detail.policy_action,
+                    destination: detail.actual_destination,
+                    simulation: detail.simulation,
+                  }
+                : previous,
+            )
+          }
+          if (!response.ok || body?.status === 'SOURCE_EXCLUDED') await inspectAudit(requestId)
+        }
+        if (returnedId) await getConversation(returnedId, bootstrap.token)
+        void loadAudits(bootstrap.token, appliedFilters)
+        return
+      }
       const headers: Record<string, string> = {
         Authorization: `Bearer ${bootstrap.token}`,
         'Content-Type': 'application/json',
@@ -446,6 +522,7 @@ export default function App() {
       const destination = response.headers.get('X-Aegis-Actual-Destination') ?? 'NONE'
       const simulation = response.headers.get('X-Aegis-Simulation') === 'true'
       setResult({
+        kind: 'CHAT',
         httpStatus: response.status,
         content: response.ok ? content : describeHttpError(response.status, code),
         code,
@@ -454,6 +531,8 @@ export default function App() {
         action,
         destination,
         simulation,
+        workflowStatus: null,
+        sources: [],
       })
       if (returnedId) setConversationId(returnedId)
       if (response.ok && content && mode === 'chat')
@@ -471,6 +550,7 @@ export default function App() {
       void loadAudits(bootstrap.token, appliedFilters)
     } catch {
       setResult({
+        kind: useProjectFiles ? 'AGENT' : 'CHAT',
         httpStatus: 0,
         content: 'Could not reach the local gateway.',
         code: null,
@@ -479,6 +559,8 @@ export default function App() {
         action: null,
         destination: 'NONE',
         simulation: false,
+        workflowStatus: null,
+        sources: [],
       })
     } finally {
       setSending(false)
@@ -623,25 +705,27 @@ export default function App() {
                   />
                 </label>
               </div>
-              <div className={styles.formField}>
-                <span>Send mode</span>
-                <div className={styles.segmented} role="group" aria-label="Send mode">
-                  <button
-                    type="button"
-                    className={mode === 'single' ? styles.selected : ''}
-                    onClick={() => setMode('single')}
-                  >
-                    Single-turn test
-                  </button>
-                  <button
-                    type="button"
-                    className={mode === 'chat' ? styles.selected : ''}
-                    onClick={() => setMode('chat')}
-                  >
-                    Continuous chat
-                  </button>
+              {!useProjectFiles && (
+                <div className={styles.formField}>
+                  <span>Send mode</span>
+                  <div className={styles.segmented} role="group" aria-label="Send mode">
+                    <button
+                      type="button"
+                      className={mode === 'single' ? styles.selected : ''}
+                      onClick={() => setMode('single')}
+                    >
+                      Single-turn test
+                    </button>
+                    <button
+                      type="button"
+                      className={mode === 'chat' ? styles.selected : ''}
+                      onClick={() => setMode('chat')}
+                    >
+                      Continuous chat
+                    </button>
+                  </div>
                 </div>
-              </div>
+              )}
               <label className={styles.formField} htmlFor="message">
                 Message
                 <textarea
@@ -649,13 +733,33 @@ export default function App() {
                   rows={5}
                   value={text}
                   onChange={(event) => setText(event.target.value)}
-                  placeholder="Type a message to test how Aegis routes it..."
+                  placeholder={
+                    useProjectFiles
+                      ? 'Ask a question about this project...'
+                      : 'Type a message to test how Aegis routes it...'
+                  }
                   disabled={sending}
                 />
               </label>
+              {workspace && (
+                <label className={styles.toolOption}>
+                  <input
+                    type="checkbox"
+                    checked={useProjectFiles}
+                    onChange={(event) => setUseProjectFiles(event.target.checked)}
+                    disabled={sending}
+                  />
+                  <span>
+                    <strong>Use project files</strong>
+                    <small>
+                      Allow the agent to search and read tracked files in {workspace.root}.
+                    </small>
+                  </span>
+                </label>
+              )}
               <details className={styles.preview}>
                 <summary>
-                  Request preview{' '}
+                  {useProjectFiles ? 'Project question preview' : 'Request preview'}{' '}
                   <span>
                     {messages.length} message{messages.length === 1 ? '' : 's'}
                   </span>
@@ -671,16 +775,22 @@ export default function App() {
               </details>
               <div className={styles.formFooter}>
                 <span>
-                  {mode === 'single'
-                    ? 'Only this message is sent. Conversation safety state still persists.'
-                    : `${history.length} previous messages will be sent with this turn.`}
+                  {useProjectFiles
+                    ? 'Only this question is sent. Tool calls and file content are screened and audited.'
+                    : mode === 'single'
+                      ? 'Only this message is sent. Conversation safety state still persists.'
+                      : `${history.length} previous messages will be sent with this turn.`}
                 </span>
                 <button
                   className={styles.primary}
                   type="submit"
                   disabled={!bootstrap || !model || !text.trim() || sending}
                 >
-                  {sending ? 'Processing...' : 'Send request ->'}
+                  {sending
+                    ? 'Processing...'
+                    : useProjectFiles
+                      ? 'Run with project files ->'
+                      : 'Send request ->'}
                 </button>
               </div>
             </form>
@@ -692,7 +802,15 @@ export default function App() {
                 <span className={styles.eyebrow}>02 / RESULT</span>
                 <h2 id="decision-title">Decision detail</h2>
               </div>
-              {result && <StatusPill value={result.action} />}
+              {result && (
+                <StatusPill
+                  value={
+                    result.kind === 'AGENT'
+                      ? (audit?.status ?? result.workflowStatus)
+                      : result.action
+                  }
+                />
+              )}
             </div>
             {!result ? (
               <div className={styles.empty}>
@@ -703,8 +821,18 @@ export default function App() {
             ) : (
               <div className={styles.result} aria-live="polite">
                 <div className={styles.resultHero}>
-                  <span className={styles.eyebrow}>ROUTING OUTCOME</span>
-                  <h3>{routeLabel(result.action, result.destination, result.simulation)}</h3>
+                  <span className={styles.eyebrow}>
+                    {result.kind === 'AGENT' ? 'PROJECT FILE TASK' : 'ROUTING OUTCOME'}
+                  </span>
+                  <h3>
+                    {result.kind === 'AGENT'
+                      ? result.workflowStatus === 'SOURCE_EXCLUDED'
+                        ? 'Project content excluded'
+                        : result.httpStatus >= 200 && result.httpStatus < 300
+                          ? 'Agent task completed'
+                          : 'Agent task failed'
+                      : routeLabel(result.action, result.destination, result.simulation)}
+                  </h3>
                   <p>
                     HTTP {result.httpStatus || 'network error'}
                     {result.code ? ` · ${result.code}` : ''}
@@ -715,15 +843,35 @@ export default function App() {
                   <Field label="Actual destination" value={result.destination} />
                   <Field label="Simulation" value={result.simulation ? 'Yes' : 'No'} />
                   <Field label="Audit status" value={audit?.status} />
+                  {result.kind === 'AGENT' && (
+                    <Field label="Task result" value={result.workflowStatus} />
+                  )}
                 </div>
                 <div className={styles.reply}>
                   <span className={styles.eyebrow}>
-                    {result.httpStatus >= 200 && result.httpStatus < 300
-                      ? 'MODEL RESPONSE'
+                    {result.httpStatus >= 200 &&
+                    result.httpStatus < 300 &&
+                    result.workflowStatus !== 'SOURCE_EXCLUDED'
+                      ? result.kind === 'AGENT'
+                        ? 'AGENT ANSWER'
+                        : 'MODEL RESPONSE'
                       : 'GATEWAY RESPONSE'}
                   </span>
                   <p>{result.content || 'No response content returned.'}</p>
                 </div>
+                {result.kind === 'AGENT' && result.sources.length > 0 && (
+                  <div className={styles.sourceList}>
+                    <strong>Files used</strong>
+                    <ul>
+                      {result.sources.map((source) => (
+                        <li key={source.source}>
+                          <code>{source.source}</code>
+                        </li>
+                      ))}
+                    </ul>
+                    <small>Model answers may be inaccurate; check the listed files.</small>
+                  </div>
+                )}
                 <Field label="Request ID" value={result.requestId} copy />
                 <Field label="Conversation ID" value={result.conversationId} copy />
               </div>
@@ -987,7 +1135,10 @@ export default function App() {
         </section>
         <footer className={styles.footer}>
           Aegis · Local demo console{' '}
-          <span>Conversation IDs retain security state. Chat context is sent by the client.</span>
+          <span>
+            Conversation IDs retain security state. Chat context is sent by the client; project
+            tasks use only the current question.
+          </span>
         </footer>
       </main>
     </div>

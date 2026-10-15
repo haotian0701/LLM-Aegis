@@ -175,7 +175,10 @@ class WorkspaceTools:
             ]
             candidates: list[tuple[int, str, int, str]] = []
             for path in sorted(self.paths):
-                target = self._file(path)
+                try:
+                    target = self._file(path)
+                except AgentFailure:
+                    continue
                 if target.stat().st_size > 262144:
                     continue
                 try:

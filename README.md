@@ -98,11 +98,11 @@ The classifier must return JSON with exactly one `CLEAR`, `BUSINESS_SECRET`, or 
 
 ## Lower-setup project agent
 
-When `demo` mode already has the cloud model and semantic classifier configured, the App opens a project agent by default. It accepts a free-text question about this checkout, lets the model call real `search_repo` and `read_file` tools, and displays the resulting file sources and audit steps. No GitHub repository, token, or approval key is needed. The old Decision Console remains at `/?view=console`.
+The Decision Console remains the default App in `demo` mode. When the cloud model and semantic classifier are configured, its request form offers **Use project files**. This sends the current question to a small read-only agent, which can call `search_repo` and `read_file`. The existing result panel shows its answer and file sources; the Audit trail shows model, tool, and screening steps. Without those settings, the original chat console is unchanged. No GitHub repository, token, or approval key is needed.
 
 The tools can read only Git-tracked text files under `src/`, `frontend/src/`, `docs/`, and `tests/`, plus `README.md` and `pyproject.toml`. They cannot write files or run shell commands proposed by the model. A local secret check and the configured injection classifier screen tool results before they enter model context. The classifier receives candidate project text; approved text may then be sent to the configured cloud model. Use this workflow only with project content suitable for those configured services.
 
-Start the App with the existing `demo` settings and existing cloud and semantic settings. Open `http://127.0.0.1:8000/` and ask, for example, “Where does the chat API choose its route? Cite the source files.” The API is `POST /v1/workflows/workspace`; the local App obtains its demo token automatically. If those model settings are absent, the original Decision Console remains the home page.
+Start the App with the existing `demo` settings and existing cloud and semantic settings. Open `http://127.0.0.1:8000/`, select **Use project files**, and ask, for example, "Where does the chat API choose its route?" The API is `POST /v1/workflows/workspace`; the local App obtains its demo token automatically.
 
 ## Connected GitHub Issues workflow
 

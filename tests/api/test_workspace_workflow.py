@@ -77,6 +77,7 @@ def test_keyword_search_and_large_file_window(repo: Path) -> None:
     )
     subprocess.run(["git", "-C", str(repo), "add", "src/aegis/main.py"], check=True)
     tools = WorkspaceTools(repo)
+    (repo / "README.md").unlink()
     results, paths = tools.call("search_repo", {"query": "Chat API model routing"})
     assert "src/aegis/main.py:800" in results
     assert "src/aegis/main.py" in paths
