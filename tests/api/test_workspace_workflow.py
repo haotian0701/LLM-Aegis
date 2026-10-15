@@ -12,6 +12,7 @@ import pytest
 from aegis.agent_provider import AgentTurn, ProposedToolCall
 from aegis.main import create_app
 from aegis.semantic import SemanticDetectionError
+from aegis.workspace_workflow import WorkspaceTools
 from tests.support import EmptyNer, FakeSemantic, MemoryStore, settings
 
 
@@ -45,6 +46,15 @@ class UncertainSemantic(FakeSemantic):
         raise SemanticDetectionError("semantic classifier was uncertain", reason="UNCERTAIN")
 
 
+class RecordingNer:
+    def __init__(self) -> None:
+        self.calls: list[Any] = []
+
+    async def detect(self, fragments: Any) -> list[Any]:
+        self.calls.append(fragments)
+        return []
+
+
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
@@ -54,7 +64,34 @@ def repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def app(repo: Path, store: MemoryStore, model: Model, semantic: FakeSemantic | None = None) -> Any:
+def test_keyword_search_and_large_file_window(repo: Path) -> None:
+    source = repo / "src" / "aegis" / "main.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "\n".join(
+            ["ordinary source line content"] * 799
+            + ["chat model route is chosen here"]
+            + ["ordinary source line content"] * 100
+        ),
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(repo), "add", "src/aegis/main.py"], check=True)
+    tools = WorkspaceTools(repo)
+    results, paths = tools.call("search_repo", {"query": "Chat API model routing"})
+    assert "src/aegis/main.py:800" in results
+    assert "src/aegis/main.py" in paths
+    window, _ = tools.call("read_file", {"path": "src/aegis/main.py", "start_line": 790})
+    assert "800: chat model route is chosen here" in window
+    assert "lines 790-849" in window
+
+
+def app(
+    repo: Path,
+    store: MemoryStore,
+    model: Model,
+    semantic: FakeSemantic | None = None,
+    ner: Any = None,
+) -> Any:
     config = settings().model_copy(
         update={
             "cloud_base_url": "https://model.example/v1",
@@ -67,7 +104,7 @@ def app(repo: Path, store: MemoryStore, model: Model, semantic: FakeSemantic | N
     return create_app(
         config,
         store=store,
-        ner_detector=EmptyNer(),
+        ner_detector=ner or EmptyNer(),
         semantic_detector=semantic or FakeSemantic(),
         agent_model=model,
         injection_detector=Screen(),
@@ -86,8 +123,9 @@ async def test_real_tracked_file_is_read_and_sent_to_model(repo: Path) -> None:
     store = MemoryStore()
     model = Model()
     semantic = FakeSemantic()
+    ner = RecordingNer()
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app(repo, store, model, semantic)),
+        transport=httpx.ASGITransport(app=app(repo, store, model, semantic, ner)),
         base_url="http://127.0.0.1",
     ) as client:
         demo_token = await token(client)
@@ -105,6 +143,7 @@ async def test_real_tracked_file_is_read_and_sent_to_model(repo: Path) -> None:
         assert semantic.calls
         assert all(fragment.message_index != 0 for call in semantic.calls for fragment in call)
         assert any(fragment.path == "messages[1].content" for fragment in semantic.calls[0])
+        assert all(fragment.message_index != 3 for call in ner.calls for fragment in call)
         detail = await client.get(
             f"/demo/audit/{body['task_id']}",
             headers={"Authorization": f"Bearer {demo_token}"},
@@ -251,3 +290,21 @@ async def test_uncertain_classifier_has_explicit_reason_and_stops_model(repo: Pa
             headers={"Authorization": f"Bearer {demo_token}"},
         )
         assert detail.json()["steps"][0]["error_code"] == "SEMANTIC_UNCERTAIN"
+
+
+@pytest.mark.asyncio
+async def test_empty_search_cannot_claim_a_completed_answer(repo: Path) -> None:
+    store = MemoryStore()
+    model = Model(arguments='{"query":"no-such-keyword-anywhere"}')
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app(repo, store, model)),
+        base_url="http://127.0.0.1",
+    ) as client:
+        demo_token = await token(client)
+        response = await client.post(
+            "/v1/workflows/workspace",
+            headers={"Authorization": f"Bearer {demo_token}"},
+            json={"model": "aegis-mock", "input": "Where is a missing feature?"},
+        )
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "NO_SOURCE_FOUND"

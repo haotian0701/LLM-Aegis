@@ -174,6 +174,7 @@ class AgentService:
         was_sensitive: bool,
         *,
         trusted_system: bool = False,
+        skip_tool_ner: bool = False,
     ) -> tuple[str | None, ProposedToolCall | None, bool]:
         request = ChatRequest(model=model_alias, messages=messages)
         all_fragments = extract_fragments(request)
@@ -192,7 +193,16 @@ class AgentService:
                 (finding.category for finding in findings), was_sensitive=was_sensitive
             )
             if initial_action != Action.BLOCK:
-                findings.extend(await self.ner_detector.detect(fragments))
+                ner_fragments = (
+                    [
+                        fragment
+                        for fragment in fragments
+                        if messages[fragment.message_index].role != "tool"
+                    ]
+                    if skip_tool_ner
+                    else fragments
+                )
+                findings.extend(await self.ner_detector.detect(ner_fragments))
             findings = unique_findings(findings)
             categories = {finding.category for finding in findings}
             action = self.policy.decide(categories, was_sensitive=was_sensitive)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import Literal, Protocol
+from urllib.parse import urlsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -70,7 +71,7 @@ class OpenAICompatibleSemanticDetector:
         if not fragments:
             return []
         items = [{"id": fragment.text_id, "text": fragment.text} for fragment in fragments]
-        payload = {
+        payload: dict[str, object] = {
             "model": self.model,
             "stream": False,
             "temperature": 0,
@@ -100,6 +101,37 @@ class OpenAICompatibleSemanticDetector:
                 },
             ],
         }
+        if urlsplit(self.url).hostname == "openrouter.ai":
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "aegis_semantic_results",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "results": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": {"type": "string"},
+                                        "label": {
+                                            "type": "string",
+                                            "enum": ["CLEAR", "BUSINESS_SECRET", "UNCERTAIN"],
+                                        },
+                                    },
+                                    "required": ["id", "label"],
+                                    "additionalProperties": False,
+                                },
+                            }
+                        },
+                        "required": ["results"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+            payload["provider"] = {"require_parameters": True}
         headers = {"Authorization": f"Bearer {self._api_key}"}
         try:
             if self._client is None:

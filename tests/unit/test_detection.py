@@ -127,3 +127,27 @@ async def test_semantic_invalid_or_uncertain_results_fail_closed(content: str) -
         )
         with pytest.raises(SemanticDetectionError):
             await detector.detect([TextFragment("a", 0, "messages[0].content", "synthetic")])
+
+
+@pytest.mark.asyncio
+async def test_openrouter_semantic_request_requires_structured_results() -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert body["response_format"]["type"] == "json_schema"
+        assert body["response_format"]["json_schema"]["strict"] is True
+        assert body["provider"]["require_parameters"] is True
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": '{"results":[{"id":"a","label":"CLEAR"}]}'}}]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        detector = OpenAICompatibleSemanticDetector(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            api_key="fake-key",
+            model="fake-model",
+            client=client,
+        )
+        assert await detector.detect([TextFragment("a", 0, "user", "synthetic")]) == []
