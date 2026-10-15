@@ -96,21 +96,35 @@ $env:AEGIS_MODEL_ALIASES_JSON = '{"aegis-mock":"replace-with-cloud-model-id"}'
 
 The classifier must return JSON with exactly one `CLEAR`, `BUSINESS_SECRET`, or `UNCERTAIN` label for every input text ID; missing or uncertain results fail closed. The optional `AEGIS_DEMO_PROVIDER=simulated_local` setting uses the configured cloud provider for `LOCAL` decisions and records the actual external destination. For frontend development, start the Python API, then run `npm run dev` in `frontend/`.
 
-## Controlled task demo (Runtime Firewall stages 0–1)
+## Connected GitHub Issues workflow
 
-In `demo` mode, the same Console workspace can run a synthetic task and show an ordered audit timeline for each model, retrieval, tool-call, and tool-result boundary. The fixed fixture accepts these three prompts: `Summarize the authorized launch notes.`, `Summarize the suspicious operations note.`, and `Show the timeout scenario.` The first returns an authorized synthetic document and source. The second causes the fake model to propose `send_email`; the independent tool policy denies it before the adapter runs. The third records an unknown result after a synthetic tool timeout. Retrieval excludes documents belonging to other principals.
+`connected` mode serves the GitHub Issue assistant from the existing App. A user enters an Issue URL from one configured repository and a free-text task. Aegis reads the Issue through GitHub's [official remote MCP server](https://github.com/github/github-mcp-server/blob/main/docs/remote-server.md), screens the returned content before adding it to model context, and audits every model and tool boundary. The agent can read the selected Issue, search code in the configured repository, and read repository files. Its only write tool is `add_issue_comment`, which creates a preview and requires approval from the same Aegis API principal within ten minutes. A rejected or expired approval never calls GitHub. An uncertain write result is recorded as `UNKNOWN` and is never retried automatically.
 
-The separate `POST /v1/agent/runs` endpoint is available only in `demo` mode. It accepts an API bearer token (or the loopback Console token), the existing optional `X-Aegis-Conversation-Id` header, and a JSON body such as:
+The configured external injection classifier receives raw Issue and tool-result text before those sources enter the model context. The existing model gate then checks each model request; its semantic classifier can also receive the approved context before masking. The task timeline records those outbound checks and the actual model destination. Use a dedicated test repository and providers approved for its data.
 
-```json
-{"model":"aegis-mock","input":"Summarize the authorized launch notes.","engine":"fixture"}
+The server pins the MCP URL and asks the remote server to expose only `issue_read`, `search_code`, `get_file_contents`, and `add_issue_comment`. At startup it checks the returned tool inventory and required argument schemas. The repository scope is enforced again for every proposed call. The GitHub token should be a fine-grained token limited to a dedicated test repository with the minimum Issue and Contents permissions needed for these tools. Use a dedicated test repository for the first live comment.
+
+Set the following variables in addition to the database, API key, and HMAC settings above. The cloud and semantic services are required in connected mode. Generate a fresh Fernet key with `.[dev]` installed; store it securely and keep it stable across restarts while approvals are pending.
+
+```powershell
+$env:AEGIS_RUN_MODE = 'connected'
+Remove-Item Env:AEGIS_DEMO_PROVIDER -ErrorAction SilentlyContinue
+$env:AEGIS_GITHUB_REPO = 'owner/dedicated-test-repo'
+$env:AEGIS_GITHUB_TOKEN = 'fine-grained-token-for-that-repo'
+$env:AEGIS_APPROVAL_KEY = & .\.venv\Scripts\python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+$env:AEGIS_SEMANTIC_URL = 'https://provider.example/v1/chat/completions'
+$env:AEGIS_SEMANTIC_API_KEY = 'classifier-key'
+$env:AEGIS_SEMANTIC_MODEL = 'classifier-model'
+$env:AEGIS_CLOUD_BASE_URL = 'https://provider.example/v1'
+$env:AEGIS_CLOUD_API_KEY = 'model-key'
+$env:AEGIS_MODEL_ALIASES_JSON = '{"issue-assistant":"cloud-model-id"}'
+.\.venv\Scripts\alembic upgrade head
+.\.venv\Scripts\python -m aegis
 ```
 
-`engine` defaults to `fixture`; success returns `task_id`, `answer`, and permitted document `sources`. Errors use the gateway's existing error envelope. The task ID is also the `X-Aegis-Request-Id` and can be inspected through the demo audit drawer. Step records retain metadata and digests, not raw document bodies or complete tool arguments.
+Open `http://127.0.0.1:8000/`, enter the configured Aegis API key, and submit an Issue URL and task. The API equivalents are `POST /v1/workflows/github-issues`, `POST /v1/approvals/{approval_id}/approve`, and `POST /v1/approvals/{approval_id}/deny`. The task response includes `task_id`, status, approved sources, and any proposed comment preview. Connected audit endpoints expose the ordered steps for the same principal. `strict` mode does not expose this UI or workflow.
 
-Selecting `engine=cloud` accepts synthetic free-text tasks and uses the configured OpenAI-compatible model for structured tool calls. It requires the external semantic classifier; that classifier sees original task and tool-result text before model masking. Every model request uses the existing four route policy. `MASK_CLOUD` sends masked text, and `LOCAL` cannot silently use a cloud model unless the process explicitly selects `simulated_local`. Cloud tool calls still pass the same independent tool policy. Use only synthetic inputs with external services.
-
-This stage uses a fixed document fixture and local fake tool adapter. An MCP server, a full RAG pipeline, external MCP proxying, and real write operations are outside the implemented stage.
+The synthetic task fixture remains available through `POST /v1/agent/runs` in `demo` mode for automated regression tests. It is no longer presented in the App.
 
 ## Verification
 

@@ -132,6 +132,26 @@ class AuditStep(Base):
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
+class PendingApproval(Base):
+    __tablename__ = "pending_approvals"
+
+    approval_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    task_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("audit_events.request_id", ondelete="CASCADE"), unique=True
+    )
+    step_id: Mapped[str] = mapped_column(String(32), ForeignKey("audit_steps.step_id"))
+    principal_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    repo: Mapped[str] = mapped_column(String(256), nullable=False)
+    issue_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    encrypted_arguments: Mapped[str | None] = mapped_column(Text, nullable=True)
+    arguments_hmac: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class ConversationAdminEvent(Base):
     __tablename__ = "conversation_admin_events"
     __table_args__ = (

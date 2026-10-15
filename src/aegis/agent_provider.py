@@ -101,11 +101,13 @@ class OpenAICompatibleAgentModel:
         api_key: str,
         model_aliases: dict[str, str],
         client: httpx.AsyncClient | None = None,
+        tools: list[dict[str, object]] | None = None,
     ) -> None:
         self.url = f"{base_url.rstrip('/')}/chat/completions"
         self._api_key = api_key
         self._model_aliases = model_aliases
         self._client = client
+        self._tools = tools
 
     async def next_turn(self, request: ChatRequest) -> AgentTurn:
         payload = {
@@ -113,7 +115,9 @@ class OpenAICompatibleAgentModel:
             "stream": False,
             "parallel_tool_calls": False,
             "messages": [message.model_dump(exclude_none=True) for message in request.messages],
-            "tools": [
+            "tools": self._tools
+            if self._tools is not None
+            else [
                 {
                     "type": "function",
                     "function": {

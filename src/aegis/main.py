@@ -24,7 +24,8 @@ from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from aegis.agent import AgentFailure, AgentRunRequest, AgentService
-from aegis.agent_provider import AgentModel
+from aegis.agent_provider import AgentModel, OpenAICompatibleAgentModel
+from aegis.approval_store import ApprovalUnavailable, PostgresApprovalStore
 from aegis.config import Settings
 from aegis.detection import (
     NerDetector,
@@ -34,6 +35,14 @@ from aegis.detection import (
     text_bytes,
     unique_findings,
 )
+from aegis.github_mcp import GithubToolProvider, RemoteGithubMcp
+from aegis.github_workflow import (
+    GITHUB_MODEL_TOOLS,
+    ApprovalError,
+    GithubIssueRequest,
+    GithubWorkflow,
+)
+from aegis.injection import InjectionDetector, OpenAICompatibleIssueDetector
 from aegis.masking import MaskingError, mask_request
 from aegis.policy import UPGRADE_CATEGORIES, Action, PolicyEngine
 from aegis.provider import (
@@ -191,6 +200,9 @@ def create_app(
     policy: PolicyEngine | None = None,
     agent_model: AgentModel | None = None,
     agent_tools: SyntheticTools | None = None,
+    github_mcp: GithubToolProvider | None = None,
+    injection_detector: InjectionDetector | None = None,
+    approval_store: PostgresApprovalStore | None = None,
 ) -> FastAPI:
     """Build the gateway; tests may inject detectors, storage and providers."""
     settings = settings or Settings.from_env()
@@ -216,7 +228,11 @@ def create_app(
     policy = policy or PolicyEngine.load(settings.policy_path)
     rule_detector = rule_detector or RuleDetector()
     ner_detector = ner_detector or SpacyEnglishNer()
-    if settings.run_mode == "demo" and semantic_detector is None and settings.semantic_url:
+    if (
+        settings.run_mode in {"demo", "connected"}
+        and semantic_detector is None
+        and settings.semantic_url
+    ):
         assert settings.semantic_api_key is not None
         assert settings.semantic_model is not None
         semantic_detector = OpenAICompatibleSemanticDetector(
@@ -233,13 +249,54 @@ def create_app(
         )
 
     engine = None
+    sessions = None
     if store is None:
         engine = create_async_engine(settings.database_url, pool_pre_ping=True)
         sessions = async_sessionmaker(engine, expire_on_commit=False)
         store = PostgresRequestStore(sessions)
 
+    connected_workflow: GithubWorkflow | None = None
+    if settings.run_mode == "connected":
+        assert settings.github_token is not None
+        assert settings.semantic_url is not None
+        assert settings.semantic_api_key is not None
+        assert settings.semantic_model is not None
+        assert settings.cloud_base_url is not None
+        assert settings.cloud_api_key is not None
+        github_mcp = github_mcp or RemoteGithubMcp(settings.github_token)
+        injection_detector = injection_detector or OpenAICompatibleIssueDetector(
+            settings.semantic_url, settings.semantic_api_key, settings.semantic_model
+        )
+        if approval_store is None:
+            if sessions is None:
+                raise ValueError("connected mode needs an approval store")
+            approval_store = PostgresApprovalStore(sessions)
+        github_agent_model = agent_model or OpenAICompatibleAgentModel(
+            base_url=settings.cloud_base_url,
+            api_key=settings.cloud_api_key,
+            model_aliases=settings.model_aliases,
+            tools=GITHUB_MODEL_TOOLS,
+        )
+        model_gate = AgentService(
+            settings=settings,
+            store=store,
+            policy=policy,
+            rule_detector=rule_detector,
+            ner_detector=ner_detector,
+            semantic_detector=semantic_detector,
+            tools=SyntheticTools(),
+            cloud_model=github_agent_model,
+        )
+        connected_workflow = GithubWorkflow(
+            settings, store, model_gate, github_mcp, injection_detector, approval_store
+        )
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        if connected_workflow is not None:
+            assert github_mcp is not None and approval_store is not None
+            await github_mcp.validate()
+            await approval_store.recover()
         yield
         if engine is not None:
             await engine.dispose()
@@ -264,6 +321,7 @@ def create_app(
             cloud_model=agent_model,
         )
     app.state.agent_service = agent_service
+    app.state.connected_workflow = connected_workflow
 
     demo_token: str | None = None
     if settings.run_mode == "demo":
@@ -436,6 +494,264 @@ def create_app(
             if summary is None:
                 return JSONResponse({"detail": "Not found"}, status_code=404, headers=demo_headers)
             return JSONResponse(jsonable_encoder(asdict(summary)), headers=demo_headers)
+
+    if connected_workflow is not None:
+        assert approval_store is not None
+        connected_headers = {
+            "Cache-Control": "no-store",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": (
+                "default-src 'none'; script-src 'self'; style-src 'self'; "
+                "connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'"
+            ),
+        }
+
+        @app.get("/", include_in_schema=False)
+        async def connected_home(request: Request) -> HTMLResponse:
+            if not _local_demo_request(request):
+                return HTMLResponse("Not found", status_code=404)
+            index = FRONTEND_DIST / "index.html"
+            if not index.is_file():
+                return HTMLResponse("Frontend build required", status_code=503)
+            return HTMLResponse(index.read_text(encoding="utf-8"), headers=connected_headers)
+
+        @app.get("/assets/{asset_path:path}", include_in_schema=False)
+        async def connected_asset(request: Request, asset_path: str) -> Response:
+            if not _local_demo_request(request):
+                return JSONResponse({"detail": "Not found"}, status_code=404)
+            asset_root = (FRONTEND_DIST / "assets").resolve()
+            asset = (asset_root / asset_path).resolve()
+            if not asset.is_relative_to(asset_root) or not asset.is_file():
+                return JSONResponse({"detail": "Not found"}, status_code=404)
+            return FileResponse(asset, headers=connected_headers)
+
+        @app.get("/connected/bootstrap", include_in_schema=False)
+        async def connected_bootstrap(request: Request) -> JSONResponse:
+            if not _local_demo_request(request):
+                return JSONResponse({"detail": "Not found"}, status_code=404)
+            return JSONResponse(
+                {"models": list(settings.model_aliases), "github_repo": settings.github_repo},
+                headers=connected_headers,
+            )
+
+        def connected_principal(request: Request) -> str | None:
+            if not _local_demo_request(request):
+                return None
+            return _authenticate(request.headers.get("authorization"), settings.api_keys)
+
+        @app.get("/connected/audits", include_in_schema=False)
+        async def connected_audits(request: Request) -> JSONResponse:
+            principal = connected_principal(request)
+            if principal is None:
+                return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+            try:
+                items = await store.list_audits(
+                    principal,
+                    limit=30,
+                    policy_action=None,
+                    status=None,
+                    conversation_id=None,
+                    before=None,
+                )
+            except Exception:
+                return JSONResponse({"detail": "Audit unavailable"}, status_code=503)
+            return JSONResponse(jsonable_encoder({"items": [asdict(item) for item in items]}))
+
+        @app.get("/connected/audit/{task_id}", include_in_schema=False)
+        async def connected_audit(request: Request, task_id: str) -> JSONResponse:
+            principal = connected_principal(request)
+            if principal is None:
+                return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+            if REQUEST_ID_PATTERN.fullmatch(task_id) is None:
+                return JSONResponse({"detail": "Not found"}, status_code=404)
+            try:
+                item = await store.get_audit_summary(task_id, principal)
+            except Exception:
+                return JSONResponse({"detail": "Audit unavailable"}, status_code=503)
+            return (
+                JSONResponse(jsonable_encoder(asdict(item)))
+                if item
+                else JSONResponse({"detail": "Not found"}, status_code=404)
+            )
+
+        @app.get("/connected/approvals", include_in_schema=False)
+        async def connected_approvals(request: Request) -> JSONResponse:
+            principal = connected_principal(request)
+            if principal is None:
+                return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+            await approval_store.recover()
+            records = await approval_store.list_pending(principal)
+            return JSONResponse(
+                jsonable_encoder(
+                    {
+                        "items": [
+                            {
+                                "approval_id": item.approval_id,
+                                "task_id": item.task_id,
+                                "repo": item.repo,
+                                "issue_number": item.issue_number,
+                                "expires_at": item.expires_at,
+                                "preview": await connected_workflow.approval_preview(item),
+                            }
+                            for item in records
+                        ]
+                    }
+                ),
+                headers=connected_headers,
+            )
+
+        @app.post("/v1/workflows/github-issues")
+        async def github_issue_run(request: Request) -> JSONResponse:
+            task_id = uuid4().hex
+            principal = _authenticate(request.headers.get("authorization"), settings.api_keys)
+            if principal is None:
+                return _error(401, "UNAUTHORIZED", "Invalid API token.", task_id)
+            try:
+                if request.headers.get("content-type", "").split(";", 1)[0] != "application/json":
+                    raise ValueError("JSON required")
+                raw = await request.body()
+                if len(raw) > MAX_BODY_BYTES:
+                    raise ValueError("body too large")
+                payload = GithubIssueRequest.model_validate_json(raw)
+                if payload.model not in settings.model_aliases:
+                    raise ValueError("unknown model")
+                assert settings.github_repo is not None
+                from aegis.github_workflow import parse_issue_url
+
+                parse_issue_url(payload.issue_url, settings.github_repo)
+            except (ValueError, ValidationError, AgentFailure):
+                return _error(400, "INVALID_REQUEST", "Invalid GitHub Issue request.", task_id)
+            conversation_id = request.headers.get("x-aegis-conversation-id") or uuid4().hex
+            if CONVERSATION_ID_PATTERN.fullmatch(conversation_id) is None:
+                return _error(400, "INVALID_REQUEST", "Invalid conversation ID.", task_id)
+            draft = AuditDraft(
+                request_id=task_id,
+                principal_id=principal,
+                conversation_id=conversation_id,
+                status="PENDING",
+                model_alias=payload.model,
+                prompt_hmac=hmac.new(
+                    settings.hmac_key.encode(), payload.input.encode(), sha256
+                ).hexdigest(),
+                task_type="AGENT",
+            )
+            try:
+                begin = await store.begin_request(draft)
+            except Exception:
+                return _error(503, "AUDIT_UNAVAILABLE", "Audit storage is unavailable.", task_id)
+            if begin.status != "CLAIMED":
+                code = "CONVERSATION_BUSY" if begin.status == "BUSY" else "CONVERSATION_CLOSED"
+                return _error(409 if begin.status == "BUSY" else 410, code, code, task_id)
+            started = time.perf_counter()
+            try:
+                async with asyncio.timeout(60):
+                    result = await connected_workflow.run(
+                        task_id=task_id,
+                        principal_id=principal,
+                        payload=payload,
+                        was_sensitive=bool(begin.was_sensitive),
+                    )
+            except AgentFailure as exc:
+                try:
+                    await store.finish_dispatch(
+                        task_id,
+                        status="BLOCKED" if exc.http_status == 403 else "FAILED",
+                        error_code=exc.code,
+                        duration_ms=round((time.perf_counter() - started) * 1000),
+                    )
+                except Exception:
+                    return _error(
+                        503, "AUDIT_UNAVAILABLE", "Audit storage is unavailable.", task_id
+                    )
+                return _error(exc.http_status, exc.code, exc.message, task_id, conversation_id)
+            except TimeoutError:
+                try:
+                    await store.finish_dispatch(
+                        task_id,
+                        status="FAILED",
+                        error_code="TASK_TIMEOUT",
+                        duration_ms=round((time.perf_counter() - started) * 1000),
+                    )
+                except Exception:
+                    return _error(
+                        503, "AUDIT_UNAVAILABLE", "Audit storage is unavailable.", task_id
+                    )
+                return _error(
+                    504, "TASK_TIMEOUT", "GitHub workflow timed out.", task_id, conversation_id
+                )
+            except Exception:
+                try:
+                    await store.finish_dispatch(
+                        task_id,
+                        status="FAILED",
+                        error_code="WORKFLOW_ERROR",
+                        duration_ms=round((time.perf_counter() - started) * 1000),
+                    )
+                except Exception:
+                    return _error(
+                        503, "AUDIT_UNAVAILABLE", "Audit storage is unavailable.", task_id
+                    )
+                return _error(
+                    502, "WORKFLOW_ERROR", "GitHub workflow failed.", task_id, conversation_id
+                )
+            if result.status != "PENDING_APPROVAL":
+                try:
+                    await store.finish_dispatch(
+                        task_id,
+                        status="BLOCKED" if result.status == "SOURCE_EXCLUDED" else "SUCCEEDED",
+                        error_code="INJECTION_DETECTED"
+                        if result.status == "SOURCE_EXCLUDED"
+                        else None,
+                        duration_ms=round((time.perf_counter() - started) * 1000),
+                    )
+                except Exception:
+                    return _error(
+                        503, "AUDIT_UNAVAILABLE", "Audit storage is unavailable.", task_id
+                    )
+            return JSONResponse(
+                jsonable_encoder(
+                    {
+                        "task_id": task_id,
+                        "status": result.status,
+                        "answer": result.answer,
+                        "sources": result.sources,
+                        "approval_id": result.approval_id,
+                        "preview": result.preview,
+                        "write_attempted": result.write_attempted,
+                    }
+                ),
+                status_code=202 if result.status == "PENDING_APPROVAL" else 200,
+                headers={"X-Aegis-Request-Id": task_id, "X-Aegis-Conversation-Id": conversation_id},
+            )
+
+        @app.post("/v1/approvals/{approval_id}/{action}")
+        async def github_approval(request: Request, approval_id: str, action: str) -> JSONResponse:
+            principal = _authenticate(request.headers.get("authorization"), settings.api_keys)
+            if principal is None:
+                return _error(401, "UNAUTHORIZED", "Invalid API token.", uuid4().hex)
+            if REQUEST_ID_PATTERN.fullmatch(approval_id) is None or action not in {
+                "approve",
+                "deny",
+            }:
+                return _error(404, "NOT_FOUND", "Approval not found.", uuid4().hex)
+            try:
+                if action == "deny":
+                    await approval_store.deny(approval_id, principal)
+                    status = "DENIED"
+                    message = "Comment rejected."
+                else:
+                    message = await connected_workflow.approve(approval_id, principal)
+                    status = "SUCCEEDED"
+            except ApprovalUnavailable:
+                return _error(409, "APPROVAL_UNAVAILABLE", "Approval is unavailable.", uuid4().hex)
+            except ApprovalError as exc:
+                return _error(exc.http_status, exc.code, str(exc), uuid4().hex)
+            except Exception:
+                return _error(
+                    503, "AUDIT_UNAVAILABLE", "Approval storage is unavailable.", uuid4().hex
+                )
+            return JSONResponse({"approval_id": approval_id, "status": status, "message": message})
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

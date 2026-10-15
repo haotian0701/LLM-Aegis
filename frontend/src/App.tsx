@@ -55,7 +55,6 @@ type Conversation = {
   updated_at: string | null
 }
 type Result = {
-  kind: 'chat' | 'agent'
   httpStatus: number
   content: string | null
   code: string | null
@@ -64,7 +63,6 @@ type Result = {
   action: string | null
   destination: string
   simulation: boolean
-  sources?: Array<{ document_id: string; title: string; source: string; version: string }>
 }
 type Filters = { policy_action: string; status: string; conversation_id: string }
 
@@ -88,12 +86,6 @@ const examples = [
     text: 'Hello again. What route handles this turn?',
     tone: 'amber',
   },
-] as const
-
-const agentExamples = [
-  { title: 'Authorized document', text: 'Summarize the authorized launch notes.' },
-  { title: 'Malicious document', text: 'Summarize the suspicious operations note.' },
-  { title: 'Tool timeout', text: 'Show the timeout scenario.' },
 ] as const
 
 const blankFilters: Filters = { policy_action: '', status: '', conversation_id: '' }
@@ -248,8 +240,6 @@ export default function App() {
   const [bootError, setBootError] = useState('')
   const [exampleError, setExampleError] = useState('')
   const [mode, setMode] = useState<SendMode>('single')
-  const [requestKind, setRequestKind] = useState<'chat' | 'agent'>('chat')
-  const [agentEngine, setAgentEngine] = useState<'fixture' | 'cloud'>('fixture')
   const [model, setModel] = useState('')
   const [text, setText] = useState('')
   const [conversationId, setConversationId] = useState('')
@@ -403,14 +393,11 @@ export default function App() {
       return
     }
     setExampleError('')
-    setRequestKind('chat')
     setMode('single')
     setText(sample)
     document.getElementById('message')?.focus()
   }
   const startNew = () => {
-    setRequestKind('chat')
-    setAgentEngine('fixture')
     setConversationId('')
     setHistory([])
     setResult(null)
@@ -439,30 +426,26 @@ export default function App() {
         'Content-Type': 'application/json',
       }
       if (conversationId.trim()) headers['X-Aegis-Conversation-Id'] = conversationId.trim()
-      const response = await fetch(
-        requestKind === 'agent' ? '/v1/agent/runs' : '/v1/chat/completions',
-        {
-          method: 'POST',
-          headers,
-          body: JSON.stringify(
-            requestKind === 'agent'
-              ? { model, input, engine: agentEngine }
-              : { model, messages: buildMessages(mode, history, input), stream: false },
-          ),
-        },
-      )
+      const response = await fetch('/v1/chat/completions', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model,
+          messages: buildMessages(mode, history, input),
+          stream: false,
+        }),
+      })
       const body = await response.json()
       const requestId = response.headers.get('X-Aegis-Request-Id')
       const returnedId = response.headers.get('X-Aegis-Conversation-Id')
       const code: string | null = body?.error?.code ?? null
       const content: string | null = response.ok
-        ? ((requestKind === 'agent' ? body?.answer : body?.choices?.[0]?.message?.content) ?? null)
+        ? (body?.choices?.[0]?.message?.content ?? null)
         : null
       const action = response.headers.get('X-Aegis-Policy-Action')
       const destination = response.headers.get('X-Aegis-Actual-Destination') ?? 'NONE'
       const simulation = response.headers.get('X-Aegis-Simulation') === 'true'
       setResult({
-        kind: requestKind,
         httpStatus: response.status,
         content: response.ok ? content : describeHttpError(response.status, code),
         code,
@@ -471,10 +454,9 @@ export default function App() {
         action,
         destination,
         simulation,
-        sources: requestKind === 'agent' && response.ok ? (body?.sources ?? []) : undefined,
       })
       if (returnedId) setConversationId(returnedId)
-      if (requestKind === 'chat' && response.ok && content && mode === 'chat')
+      if (response.ok && content && mode === 'chat')
         setHistory((previous) => [
           ...previous,
           { role: 'user', content: input },
@@ -489,7 +471,6 @@ export default function App() {
       void loadAudits(bootstrap.token, appliedFilters)
     } catch {
       setResult({
-        kind: requestKind,
         httpStatus: 0,
         content: 'Could not reach the local gateway.',
         code: null,
@@ -606,37 +587,6 @@ export default function App() {
           )}
         </section>
 
-        <section className={styles.agentExamples} aria-label="Controlled task examples">
-          <div className={styles.sectionHeading}>
-            <div>
-              <span className={styles.eyebrow}>RUNTIME FIREWALL</span>
-              <h2>Controlled tasks</h2>
-            </div>
-            <span className={styles.muted}>Synthetic documents and tools</span>
-          </div>
-          <div className={styles.exampleGrid}>
-            {agentExamples.map((example) => (
-              <button
-                key={example.title}
-                type="button"
-                className={styles.exampleCard}
-                onClick={() => {
-                  setRequestKind('agent')
-                  setAgentEngine('fixture')
-                  setText(example.text)
-                  document.getElementById('message')?.focus()
-                }}
-              >
-                <span>
-                  <strong>{example.title}</strong>
-                  <small>Controlled task fixture</small>
-                </span>
-                <span className={styles.exampleArrow}>→</span>
-              </button>
-            ))}
-          </div>
-        </section>
-
         <div className={styles.columns}>
           <section id="workspace" className={styles.panel} aria-labelledby="workspace-title">
             <div className={styles.panelHeader}>
@@ -674,60 +624,24 @@ export default function App() {
                 </label>
               </div>
               <div className={styles.formField}>
-                <span>Request type</span>
-                <div className={styles.segmented} role="group" aria-label="Request type">
+                <span>Send mode</span>
+                <div className={styles.segmented} role="group" aria-label="Send mode">
                   <button
                     type="button"
-                    className={requestKind === 'chat' ? styles.selected : ''}
-                    onClick={() => setRequestKind('chat')}
+                    className={mode === 'single' ? styles.selected : ''}
+                    onClick={() => setMode('single')}
                   >
-                    Chat
+                    Single-turn test
                   </button>
                   <button
                     type="button"
-                    className={requestKind === 'agent' ? styles.selected : ''}
-                    onClick={() => setRequestKind('agent')}
+                    className={mode === 'chat' ? styles.selected : ''}
+                    onClick={() => setMode('chat')}
                   >
-                    Controlled task
+                    Continuous chat
                   </button>
                 </div>
               </div>
-              {requestKind === 'agent' && (
-                <label className={styles.formField}>
-                  Agent engine
-                  <select
-                    value={agentEngine}
-                    onChange={(event) => setAgentEngine(event.target.value as 'fixture' | 'cloud')}
-                  >
-                    <option value="fixture">Deterministic fixture</option>
-                    <option value="cloud">Configured cloud model</option>
-                  </select>
-                  <small>
-                    Cloud mode sends synthetic task text to configured external services.
-                  </small>
-                </label>
-              )}
-              {requestKind === 'chat' && (
-                <div className={styles.formField}>
-                  <span>Send mode</span>
-                  <div className={styles.segmented} role="group" aria-label="Send mode">
-                    <button
-                      type="button"
-                      className={mode === 'single' ? styles.selected : ''}
-                      onClick={() => setMode('single')}
-                    >
-                      Single-turn test
-                    </button>
-                    <button
-                      type="button"
-                      className={mode === 'chat' ? styles.selected : ''}
-                      onClick={() => setMode('chat')}
-                    >
-                      Continuous chat
-                    </button>
-                  </div>
-                </div>
-              )}
               <label className={styles.formField} htmlFor="message">
                 Message
                 <textarea
@@ -735,52 +649,38 @@ export default function App() {
                   rows={5}
                   value={text}
                   onChange={(event) => setText(event.target.value)}
-                  placeholder={
-                    requestKind === 'agent'
-                      ? 'Enter a synthetic task...'
-                      : 'Type a message to test how Aegis routes it...'
-                  }
+                  placeholder="Type a message to test how Aegis routes it..."
                   disabled={sending}
                 />
               </label>
-              {requestKind === 'chat' && (
-                <details className={styles.preview}>
-                  <summary>
-                    Request preview{' '}
-                    <span>
-                      {messages.length} message{messages.length === 1 ? '' : 's'}
-                    </span>
-                  </summary>
-                  <div className={styles.previewBody}>
-                    {messages.map((message, index) => (
-                      <div key={index}>
-                        <strong>{message.role}</strong>
-                        <p>{message.content || 'Current message is empty.'}</p>
-                      </div>
-                    ))}
-                  </div>
-                </details>
-              )}
+              <details className={styles.preview}>
+                <summary>
+                  Request preview{' '}
+                  <span>
+                    {messages.length} message{messages.length === 1 ? '' : 's'}
+                  </span>
+                </summary>
+                <div className={styles.previewBody}>
+                  {messages.map((message, index) => (
+                    <div key={index}>
+                      <strong>{message.role}</strong>
+                      <p>{message.content || 'Current message is empty.'}</p>
+                    </div>
+                  ))}
+                </div>
+              </details>
               <div className={styles.formFooter}>
                 <span>
-                  {requestKind === 'agent'
-                    ? agentEngine === 'fixture'
-                      ? 'Fixture accepts the three preset tasks.'
-                      : 'Cloud mode accepts synthetic free-text tasks.'
-                    : mode === 'single'
-                      ? 'Only this message is sent. Conversation safety state still persists.'
-                      : `${history.length} previous messages will be sent with this turn.`}
+                  {mode === 'single'
+                    ? 'Only this message is sent. Conversation safety state still persists.'
+                    : `${history.length} previous messages will be sent with this turn.`}
                 </span>
                 <button
                   className={styles.primary}
                   type="submit"
                   disabled={!bootstrap || !model || !text.trim() || sending}
                 >
-                  {sending
-                    ? 'Processing…'
-                    : requestKind === 'agent'
-                      ? 'Run task →'
-                      : 'Send request →'}
+                  {sending ? 'Processing...' : 'Send request ->'}
                 </button>
               </div>
             </form>
@@ -792,11 +692,7 @@ export default function App() {
                 <span className={styles.eyebrow}>02 / RESULT</span>
                 <h2 id="decision-title">Decision detail</h2>
               </div>
-              {result && (
-                <StatusPill
-                  value={result.kind === 'agent' ? (audit?.status ?? null) : result.action}
-                />
-              )}
+              {result && <StatusPill value={result.action} />}
             </div>
             {!result ? (
               <div className={styles.empty}>
@@ -808,33 +704,16 @@ export default function App() {
               <div className={styles.result} aria-live="polite">
                 <div className={styles.resultHero}>
                   <span className={styles.eyebrow}>ROUTING OUTCOME</span>
-                  <h3>
-                    {result.kind === 'agent'
-                      ? 'Controlled task'
-                      : routeLabel(result.action, result.destination, result.simulation)}
-                  </h3>
+                  <h3>{routeLabel(result.action, result.destination, result.simulation)}</h3>
                   <p>
                     HTTP {result.httpStatus || 'network error'}
                     {result.code ? ` · ${result.code}` : ''}
                   </p>
                 </div>
                 <div className={styles.resultGrid}>
-                  <Field
-                    label="Policy action"
-                    value={result.kind === 'agent' ? audit?.policy_action : result.action}
-                  />
-                  <Field
-                    label="Actual destination"
-                    value={result.kind === 'agent' ? audit?.actual_destination : result.destination}
-                  />
-                  <Field
-                    label="Simulation"
-                    value={
-                      (result.kind === 'agent' ? audit?.simulation : result.simulation)
-                        ? 'Yes'
-                        : 'No'
-                    }
-                  />
+                  <Field label="Policy action" value={result.action} />
+                  <Field label="Actual destination" value={result.destination} />
+                  <Field label="Simulation" value={result.simulation ? 'Yes' : 'No'} />
                   <Field label="Audit status" value={audit?.status} />
                 </div>
                 <div className={styles.reply}>
@@ -845,16 +724,6 @@ export default function App() {
                   </span>
                   <p>{result.content || 'No response content returned.'}</p>
                 </div>
-                {!!result.sources?.length && (
-                  <div className={styles.reply}>
-                    <span className={styles.eyebrow}>DOCUMENT SOURCES</span>
-                    {result.sources.map((source) => (
-                      <p key={source.document_id}>
-                        {source.title} · {source.document_id} · {source.version}
-                      </p>
-                    ))}
-                  </div>
-                )}
                 <Field label="Request ID" value={result.requestId} copy />
                 <Field label="Conversation ID" value={result.conversationId} copy />
               </div>
