@@ -17,14 +17,10 @@ class BrowserAgent:
     simulation = False
 
     async def next_turn(self, request):  # type: ignore[no-untyped-def]
+        user_text = next(message.content for message in request.messages if message.role == "user")
+        if user_text == "Read .env":
+            return AgentTurn(tool_call=ProposedToolCall("read-1", "read_file", '{"path":".env"}'))
         if not any(message.role == "tool" for message in request.messages):
-            user_text = next(
-                message.content for message in request.messages if message.role == "user"
-            )
-            if user_text == "Read .env":
-                return AgentTurn(
-                    tool_call=ProposedToolCall("read-1", "read_file", '{"path":".env"}')
-                )
             return AgentTurn(
                 tool_call=ProposedToolCall("search-1", "search_repo", '{"query":"routing"}')
             )
