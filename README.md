@@ -98,41 +98,11 @@ The classifier must return JSON with exactly one `CLEAR`, `BUSINESS_SECRET`, or 
 
 ## Lower-setup project agent
 
-The Decision Console remains the default App in `demo` mode. When the cloud model and semantic classifier are configured, its request form offers **Use project files**. This sends the current question to a small read-only agent, which can call `search_repo` and `read_file`. The existing result panel shows its answer and file sources; the Audit trail shows model, tool, and screening steps. Without those settings, the original chat console is unchanged. No GitHub repository, token, or approval key is needed.
+The Decision Console remains the default App in `demo` mode. When the cloud model and semantic classifier are configured, its request form offers **Use project files**. This first searches permitted local files through the audited tool gate, then lets the model answer or request further read-only tools. The existing result panel shows its answer and file sources; the Audit trail shows model, tool, and screening steps. Without those settings, the original chat console is unchanged.
 
 The tools can read only Git-tracked text files under `src/`, `frontend/src/`, `docs/`, and `tests/`, plus `README.md` and `pyproject.toml`. They cannot write files or run shell commands proposed by the model. A local secret check and the configured injection classifier screen tool results before they enter model context. The classifier receives candidate project text; approved text may then be sent to the configured cloud model. Use this workflow only with project content suitable for those configured services.
 
 Start the App with the existing `demo` settings and existing cloud and semantic settings. Open `http://127.0.0.1:8000/`, select **Use project files**, and ask, for example, "Where does the chat API choose its route?" The API is `POST /v1/workflows/workspace`; the local App obtains its demo token automatically.
-
-## Connected GitHub Issues workflow
-
-`connected` mode serves the GitHub Issue assistant from the existing App. A user enters an Issue URL from one configured repository and a free-text task. Aegis reads the Issue through GitHub's [official remote MCP server](https://github.com/github/github-mcp-server/blob/main/docs/remote-server.md), screens the returned content before adding it to model context, and audits every model and tool boundary. The agent can read the selected Issue, search code in the configured repository, and read repository files. Its only write tool is `add_issue_comment`, which creates a preview and requires approval from the same Aegis API principal within ten minutes. A rejected or expired approval never calls GitHub. An uncertain write result is recorded as `UNKNOWN` and is never retried automatically.
-
-The configured external injection classifier receives raw Issue and tool-result text before those sources enter the model context. The existing model gate then checks each model request; its semantic classifier can also receive the approved context before masking. The task timeline records those outbound checks and the actual model destination. Use a dedicated test repository and providers approved for its data.
-
-The server pins the MCP URL and asks the remote server to expose only `issue_read`, `search_code`, `get_file_contents`, and `add_issue_comment`. At startup it checks the returned tool inventory and required argument schemas. The repository scope is enforced again for every proposed call. The GitHub token should be a fine-grained token limited to a dedicated test repository with the minimum Issue and Contents permissions needed for these tools. Use a dedicated test repository for the first live comment.
-
-Set the following variables in addition to the database, API key, and HMAC settings above. The cloud and semantic services are required in connected mode. Generate a fresh Fernet key with `.[dev]` installed; store it securely and keep it stable across restarts while approvals are pending.
-
-```powershell
-$env:AEGIS_RUN_MODE = 'connected'
-Remove-Item Env:AEGIS_DEMO_PROVIDER -ErrorAction SilentlyContinue
-$env:AEGIS_GITHUB_REPO = 'owner/dedicated-test-repo'
-$env:AEGIS_GITHUB_TOKEN = 'fine-grained-token-for-that-repo'
-$env:AEGIS_APPROVAL_KEY = & .\.venv\Scripts\python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
-$env:AEGIS_SEMANTIC_URL = 'https://provider.example/v1/chat/completions'
-$env:AEGIS_SEMANTIC_API_KEY = 'classifier-key'
-$env:AEGIS_SEMANTIC_MODEL = 'classifier-model'
-$env:AEGIS_CLOUD_BASE_URL = 'https://provider.example/v1'
-$env:AEGIS_CLOUD_API_KEY = 'model-key'
-$env:AEGIS_MODEL_ALIASES_JSON = '{"issue-assistant":"cloud-model-id"}'
-.\.venv\Scripts\alembic upgrade head
-.\.venv\Scripts\python -m aegis
-```
-
-Open `http://127.0.0.1:8000/`, enter the configured Aegis API key, and submit an Issue URL and task. The API equivalents are `POST /v1/workflows/github-issues`, `POST /v1/approvals/{approval_id}/approve`, and `POST /v1/approvals/{approval_id}/deny`. The task response includes `task_id`, status, approved sources, and any proposed comment preview. Connected audit endpoints expose the ordered steps for the same principal. `strict` mode does not expose this UI or workflow.
-
-The synthetic task fixture remains available through `POST /v1/agent/runs` in `demo` mode for automated regression tests. It is no longer presented in the App.
 
 ## Verification
 

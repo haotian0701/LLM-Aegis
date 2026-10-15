@@ -202,6 +202,21 @@ async def test_model_can_answer_after_planned_search_without_calling_tool(repo: 
 
 
 @pytest.mark.asyncio
+async def test_obsolete_workflow_routes_are_absent(repo: Path) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app(repo, MemoryStore(), AnswerWithoutTool())),
+        base_url="http://127.0.0.1",
+    ) as client:
+        demo_token = await token(client)
+        headers = {"Authorization": f"Bearer {demo_token}"}
+        assert (await client.post("/v1/agent/runs", headers=headers)).status_code == 404
+        assert (
+            await client.post("/v1/workflows/github-issues", headers=headers)
+        ).status_code == 404
+        assert (await client.get("/connected/bootstrap", headers=headers)).status_code == 404
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("name", "arguments"),
     [
@@ -337,9 +352,7 @@ async def test_uncertain_classifier_has_explicit_reason_and_stops_model(repo: Pa
             f"/demo/audit/{response.headers['X-Aegis-Request-Id']}",
             headers={"Authorization": f"Bearer {demo_token}"},
         )
-        assert any(
-            step["error_code"] == "SEMANTIC_UNCERTAIN" for step in detail.json()["steps"]
-        )
+        assert any(step["error_code"] == "SEMANTIC_UNCERTAIN" for step in detail.json()["steps"])
 
 
 @pytest.mark.asyncio

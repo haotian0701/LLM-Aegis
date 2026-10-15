@@ -16,7 +16,7 @@ class Settings(BaseModel):
     database_url: str
     api_keys: dict[str, str]
     hmac_key: str = Field(min_length=32)
-    run_mode: Literal["strict", "demo", "connected"] = "strict"
+    run_mode: Literal["strict", "demo"] = "strict"
     demo_provider: Literal["mock", "simulated_local"] | None = None
     model_aliases: dict[str, str] = Field(default_factory=lambda: {"aegis-mock": "mock-v1"})
     policy_path: str | None = None
@@ -25,9 +25,6 @@ class Settings(BaseModel):
     semantic_model: str | None = None
     cloud_base_url: str | None = None
     cloud_api_key: str | None = None
-    github_token: str | None = None
-    github_repo: str | None = None
-    approval_key: str | None = None
 
     @model_validator(mode="after")
     def validate_security_settings(self) -> Settings:
@@ -47,26 +44,6 @@ class Settings(BaseModel):
             raise ValueError("strict mode cannot load a demo provider")
         if self.run_mode == "demo" and self.demo_provider is None:
             raise ValueError("demo mode requires AEGIS_DEMO_PROVIDER")
-        if self.run_mode == "connected":
-            if self.demo_provider is not None:
-                raise ValueError("connected mode cannot load a demo provider")
-            if not all((self.github_token, self.github_repo, self.approval_key)):
-                raise ValueError("connected mode requires GitHub and approval configuration")
-            if not self.cloud_base_url or not self.cloud_api_key:
-                raise ValueError("connected mode requires a cloud model")
-            if not all((self.semantic_url, self.semantic_api_key, self.semantic_model)):
-                raise ValueError("connected mode requires semantic detection")
-            from cryptography.fernet import Fernet
-
-            assert self.approval_key is not None and self.github_repo is not None
-            try:
-                Fernet(self.approval_key.encode("ascii"))
-            except (ValueError, TypeError) as exc:
-                raise ValueError("approval key must be a Fernet key") from exc
-            import re
-
-            if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.github_repo) is None:
-                raise ValueError("github repo must be owner/repo")
         semantic_values = (self.semantic_url, self.semantic_api_key, self.semantic_model)
         if any(semantic_values) and not all(semantic_values):
             raise ValueError("semantic URL, API key and model must all be configured")
@@ -123,8 +100,5 @@ class Settings(BaseModel):
                 "semantic_model": os.environ.get("AEGIS_SEMANTIC_MODEL") or None,
                 "cloud_base_url": os.environ.get("AEGIS_CLOUD_BASE_URL") or None,
                 "cloud_api_key": os.environ.get("AEGIS_CLOUD_API_KEY") or None,
-                "github_token": os.environ.get("AEGIS_GITHUB_TOKEN") or None,
-                "github_repo": os.environ.get("AEGIS_GITHUB_REPO") or None,
-                "approval_key": os.environ.get("AEGIS_APPROVAL_KEY") or None,
             }
         )

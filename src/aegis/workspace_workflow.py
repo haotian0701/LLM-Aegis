@@ -165,9 +165,26 @@ class WorkspaceTools:
                 for term in re.findall(r"[a-z0-9_]+", query.lower())
                 if term
                 not in {
-                    "a", "an", "and", "describe", "determine", "does", "explain", "find",
-                    "for", "how", "in", "is", "of", "on", "show", "the", "this", "to",
-                    "what", "where",
+                    "a",
+                    "an",
+                    "and",
+                    "describe",
+                    "determine",
+                    "does",
+                    "explain",
+                    "find",
+                    "for",
+                    "how",
+                    "in",
+                    "is",
+                    "of",
+                    "on",
+                    "show",
+                    "the",
+                    "this",
+                    "to",
+                    "what",
+                    "where",
                 }
             ]
             if not terms:
@@ -202,6 +219,7 @@ class WorkspaceTools:
             sources: list[str] = []
             matches: list[str] = []
             path_counts: dict[str, int] = {}
+
             def relevance(item: tuple[set[str], str, int, str]) -> float:
                 hits, path, _, _ = item
                 bonus = (
@@ -326,9 +344,26 @@ class WorkspaceWorkflow:
             for word in re.findall(r"[a-zA-Z0-9_]+", payload.input)
             if word.lower()
             not in {
-                "a", "an", "and", "describe", "determine", "does", "explain", "find",
-                "for", "how", "in", "is", "of", "on", "show", "the", "this", "to",
-                "what", "where",
+                "a",
+                "an",
+                "and",
+                "describe",
+                "determine",
+                "does",
+                "explain",
+                "find",
+                "for",
+                "how",
+                "in",
+                "is",
+                "of",
+                "on",
+                "show",
+                "the",
+                "this",
+                "to",
+                "what",
+                "where",
             }
         ]
         query = " ".join(keywords[:12])[:80] or payload.input[:80]
@@ -343,7 +378,6 @@ class WorkspaceWorkflow:
                     task_id,
                     payload.model,
                     messages,
-                    "cloud",
                     was_sensitive,
                     trusted_system=True,
                     user_only_ner=True,

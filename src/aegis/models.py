@@ -133,6 +133,8 @@ class AuditStep(Base):
 
 
 class PendingApproval(Base):
+    """Historical schema mapping; the Issue approval workflow is no longer active."""
+
     __tablename__ = "pending_approvals"
 
     approval_id: Mapped[str] = mapped_column(String(32), primary_key=True)
