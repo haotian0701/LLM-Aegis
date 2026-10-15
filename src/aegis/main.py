@@ -23,6 +23,8 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from aegis.agent import AgentFailure, AgentService
+from aegis.agent_provider import AgentModel, OpenAICompatibleAgentModel
 from aegis.config import Settings
 from aegis.detection import (
     NerDetector,
@@ -32,6 +34,7 @@ from aegis.detection import (
     text_bytes,
     unique_findings,
 )
+from aegis.injection import InjectionDetector, OpenAICompatibleSourceDetector
 from aegis.masking import MaskingError, mask_request
 from aegis.policy import UPGRADE_CATEGORIES, Action, PolicyEngine
 from aegis.provider import (
@@ -48,6 +51,12 @@ from aegis.schemas import (
 )
 from aegis.semantic import OpenAICompatibleSemanticDetector, SemanticDetector
 from aegis.store import AuditDraft, PostgresRequestStore, RequestStore
+from aegis.workspace_workflow import (
+    WORKSPACE_MODEL_TOOLS,
+    WorkspaceRequest,
+    WorkspaceTools,
+    WorkspaceWorkflow,
+)
 
 CONVERSATION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 REQUEST_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
@@ -186,6 +195,9 @@ def create_app(
     ner_detector: NerDetector | None = None,
     semantic_detector: SemanticDetector | None = None,
     policy: PolicyEngine | None = None,
+    agent_model: AgentModel | None = None,
+    injection_detector: InjectionDetector | None = None,
+    workspace_root: Path | None = None,
 ) -> FastAPI:
     """Build the gateway; tests may inject detectors, storage and providers."""
     settings = settings or Settings.from_env()
@@ -228,6 +240,7 @@ def create_app(
         )
 
     engine = None
+    sessions = None
     if store is None:
         engine = create_async_engine(settings.database_url, pool_pre_ping=True)
         sessions = async_sessionmaker(engine, expire_on_commit=False)
@@ -246,7 +259,42 @@ def create_app(
     app.state.cloud_provider = cloud_provider
     app.state.policy = policy
 
+    workspace_workflow: WorkspaceWorkflow | None = None
+    if settings.run_mode == "demo" and all(
+        (settings.cloud_base_url, settings.cloud_api_key, settings.semantic_url)
+    ):
+        assert settings.cloud_base_url is not None and settings.cloud_api_key is not None
+        assert settings.semantic_url is not None
+        assert settings.semantic_api_key is not None and settings.semantic_model is not None
+        workspace_model = agent_model or OpenAICompatibleAgentModel(
+            base_url=settings.cloud_base_url,
+            api_key=settings.cloud_api_key,
+            model_aliases=settings.model_aliases,
+            tools=WORKSPACE_MODEL_TOOLS,
+        )
+        workspace_gate = AgentService(
+            settings=settings,
+            store=store,
+            policy=policy,
+            rule_detector=rule_detector,
+            ner_detector=ner_detector,
+            semantic_detector=semantic_detector,
+            cloud_model=workspace_model,
+        )
+        workspace_workflow = WorkspaceWorkflow(
+            settings,
+            store,
+            workspace_gate,
+            WorkspaceTools(workspace_root or Path(__file__).resolve().parents[2]),
+            injection_detector
+            or OpenAICompatibleSourceDetector(
+                settings.semantic_url, settings.semantic_api_key, settings.semantic_model
+            ),
+        )
+    app.state.workspace_workflow = workspace_workflow
+
     demo_token: str | None = None
+    demo_headers: dict[str, str] = {}
     if settings.run_mode == "demo":
         if DEMO_PRINCIPAL in settings.api_keys:
             raise ValueError("reserved demo browser principal is configured")
@@ -417,6 +465,116 @@ def create_app(
             if summary is None:
                 return JSONResponse({"detail": "Not found"}, status_code=404, headers=demo_headers)
             return JSONResponse(jsonable_encoder(asdict(summary)), headers=demo_headers)
+
+    if workspace_workflow is not None:
+        assert demo_token is not None
+
+        @app.get("/workspace/bootstrap", include_in_schema=False)
+        async def workspace_bootstrap(request: Request) -> JSONResponse:
+            if not _local_demo_request(request):
+                return JSONResponse({"detail": "Not found"}, status_code=404)
+            return JSONResponse(
+                {
+                    "token": demo_token,
+                    "models": list(settings.model_aliases),
+                    "root": workspace_workflow.tools.root.name,
+                },
+                headers=demo_headers,
+            )
+
+        @app.post("/v1/workflows/workspace")
+        async def workspace_run(request: Request) -> JSONResponse:
+            task_id = uuid4().hex
+            if not _local_demo_request(request):
+                return _error(404, "NOT_FOUND", "Workflow is local only.", task_id)
+            authorization = request.headers.get("authorization", "")
+            if not authorization.startswith("Bearer ") or not hmac.compare_digest(
+                authorization[len("Bearer ") :], demo_token
+            ):
+                return _error(401, "UNAUTHORIZED", "Invalid demo token.", task_id)
+            try:
+                if request.headers.get("content-type", "").split(";", 1)[0] != "application/json":
+                    raise ValueError("JSON required")
+                raw = await request.body()
+                if len(raw) > MAX_BODY_BYTES:
+                    raise ValueError("body too large")
+                payload = WorkspaceRequest.model_validate_json(raw)
+                if payload.model not in settings.model_aliases:
+                    raise ValueError("unknown model")
+            except (ValueError, ValidationError):
+                return _error(400, "INVALID_REQUEST", "Invalid project task.", task_id)
+            conversation_id = request.headers.get("x-aegis-conversation-id") or uuid4().hex
+            if CONVERSATION_ID_PATTERN.fullmatch(conversation_id) is None:
+                return _error(400, "INVALID_REQUEST", "Invalid conversation ID.", task_id)
+            draft = AuditDraft(
+                request_id=task_id,
+                principal_id=DEMO_PRINCIPAL,
+                conversation_id=conversation_id,
+                status="PENDING",
+                model_alias=payload.model,
+                prompt_hmac=hmac.new(
+                    settings.hmac_key.encode(), payload.input.encode(), sha256
+                ).hexdigest(),
+                task_type="AGENT",
+            )
+            try:
+                begin = await store.begin_request(draft)
+            except Exception:
+                return _error(503, "AUDIT_UNAVAILABLE", "Audit storage is unavailable.", task_id)
+            if begin.status != "CLAIMED":
+                code = "CONVERSATION_BUSY" if begin.status == "BUSY" else "CONVERSATION_CLOSED"
+                return _error(409 if begin.status == "BUSY" else 410, code, code, task_id)
+            started = time.perf_counter()
+            result = None
+            failure = None
+            try:
+                async with asyncio.timeout(60):
+                    result = await workspace_workflow.run(
+                        task_id, payload, bool(begin.was_sensitive)
+                    )
+            except AgentFailure as exc:
+                failure = exc
+            except TimeoutError:
+                failure = AgentFailure(504, "TASK_TIMEOUT", "Project task timed out.")
+            except Exception:
+                failure = AgentFailure(502, "WORKFLOW_ERROR", "Project task failed.")
+            assert failure is not None or result is not None
+            if failure is not None:
+                final_status = "BLOCKED" if failure.http_status == 403 else "FAILED"
+                final_error = failure.code
+            else:
+                assert result is not None
+                final_status = "BLOCKED" if result.status == "SOURCE_EXCLUDED" else "SUCCEEDED"
+                final_error = "INJECTION_DETECTED" if result.status == "SOURCE_EXCLUDED" else None
+            try:
+                await store.finish_dispatch(
+                    task_id,
+                    status=final_status,
+                    error_code=final_error,
+                    duration_ms=round((time.perf_counter() - started) * 1000),
+                )
+            except Exception:
+                return _error(503, "AUDIT_UNAVAILABLE", "Audit storage is unavailable.", task_id)
+            if failure:
+                return _error(
+                    failure.http_status,
+                    failure.code,
+                    failure.message,
+                    task_id,
+                    conversation_id,
+                )
+            assert result is not None
+            return JSONResponse(
+                jsonable_encoder(
+                    {
+                        "task_id": task_id,
+                        "status": result.status,
+                        "answer": result.answer,
+                        "sources": result.sources,
+                    }
+                ),
+                headers={"X-Aegis-Request-Id": task_id, "X-Aegis-Conversation-Id": conversation_id},
+            )
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

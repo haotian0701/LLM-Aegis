@@ -9,7 +9,7 @@
     "typecheck": "tsc -b --pretty false",
     "test": "vitest run",
     "format:check": "prettier --check .",
-    "browser:smoke": "node tests/browser-smoke.mjs"
+    "browser:smoke": "node tests/browser-smoke.mjs && node tests/browser-workspace.mjs"
   },
   "dependencies": {
     "react": "^19.2.0",

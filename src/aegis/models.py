@@ -8,10 +8,12 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
+    ForeignKey,
     ForeignKeyConstraint,
     Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -61,6 +63,9 @@ class AuditEvent(Base):
     )
 
     request_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    task_type: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="CHAT", server_default="CHAT"
+    )
     principal_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     conversation_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     started_at: Mapped[datetime | None] = mapped_column(
@@ -95,6 +100,58 @@ class AuditEvent(Base):
     total_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class AuditStep(Base):
+    __tablename__ = "audit_steps"
+    __table_args__ = (UniqueConstraint("task_id", "sequence", name="uq_audit_step_order"),)
+
+    step_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    task_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("audit_events.request_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    source: Mapped[str] = mapped_column(String(128), nullable=False)
+    target: Mapped[str] = mapped_column(String(256), nullable=False)
+    input_summary: Mapped[str] = mapped_column(String(256), nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    matched_rules: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    data_categories: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    decision: Mapped[str] = mapped_column(String(24), nullable=False)
+    execution_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    executed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    actual_destination: Mapped[str] = mapped_column(String(256), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class PendingApproval(Base):
+    """Historical schema mapping; the Issue approval workflow is no longer active."""
+
+    __tablename__ = "pending_approvals"
+
+    approval_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    task_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("audit_events.request_id", ondelete="CASCADE"), unique=True
+    )
+    step_id: Mapped[str] = mapped_column(String(32), ForeignKey("audit_steps.step_id"))
+    principal_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    repo: Mapped[str] = mapped_column(String(256), nullable=False)
+    issue_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    encrypted_arguments: Mapped[str | None] = mapped_column(Text, nullable=True)
+    arguments_hmac: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class ConversationAdminEvent(Base):
