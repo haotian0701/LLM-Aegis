@@ -23,6 +23,8 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from aegis.agent import AgentFailure, AgentRunRequest, AgentService
+from aegis.agent_provider import AgentModel
 from aegis.config import Settings
 from aegis.detection import (
     NerDetector,
@@ -40,6 +42,7 @@ from aegis.provider import (
     OpenAICompatibleCloudProvider,
     SimulatedLocalProvider,
 )
+from aegis.runtime_policy import SyntheticTools
 from aegis.schemas import (
     ChatCompletionChoice,
     ChatCompletionMessage,
@@ -186,6 +189,8 @@ def create_app(
     ner_detector: NerDetector | None = None,
     semantic_detector: SemanticDetector | None = None,
     policy: PolicyEngine | None = None,
+    agent_model: AgentModel | None = None,
+    agent_tools: SyntheticTools | None = None,
 ) -> FastAPI:
     """Build the gateway; tests may inject detectors, storage and providers."""
     settings = settings or Settings.from_env()
@@ -245,6 +250,20 @@ def create_app(
     app.state.provider = provider
     app.state.cloud_provider = cloud_provider
     app.state.policy = policy
+
+    agent_service: AgentService | None = None
+    if settings.run_mode == "demo":
+        agent_service = AgentService(
+            settings=settings,
+            store=store,
+            policy=policy,
+            rule_detector=rule_detector,
+            ner_detector=ner_detector,
+            semantic_detector=semantic_detector,
+            tools=agent_tools or SyntheticTools(),
+            cloud_model=agent_model,
+        )
+    app.state.agent_service = agent_service
 
     demo_token: str | None = None
     if settings.run_mode == "demo":
@@ -421,6 +440,162 @@ def create_app(
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
+
+    if agent_service is not None:
+
+        @app.post("/v1/agent/runs")
+        async def agent_runs(http_request: Request) -> JSONResponse:
+            task_id = uuid4().hex
+            started = time.perf_counter()
+            principal_id = _authenticate(
+                http_request.headers.get("authorization"), settings.api_keys
+            )
+            if (
+                principal_id is None
+                and demo_token is not None
+                and _local_demo_request(http_request)
+            ):
+                header = http_request.headers.get("authorization")
+                if header is not None and header.startswith("Bearer "):
+                    if hmac.compare_digest(header[len("Bearer ") :], demo_token):
+                        principal_id = DEMO_PRINCIPAL
+
+            async def reject(code: str, status: int, message: str) -> JSONResponse:
+                try:
+                    await store.record_rejection(
+                        AuditDraft(
+                            request_id=task_id,
+                            principal_id=principal_id,
+                            conversation_id=None,
+                            status="REJECTED",
+                            model_alias=None,
+                            prompt_hmac=None,
+                            error_code=code,
+                            task_type="AGENT",
+                        )
+                    )
+                except Exception:
+                    return _error(
+                        503, "AUDIT_UNAVAILABLE", "Audit storage is unavailable.", task_id
+                    )
+                return _error(status, code, message, task_id)
+
+            if principal_id is None:
+                return await reject("UNAUTHORIZED", 401, "Invalid API token.")
+            if (
+                http_request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                != "application/json"
+            ):
+                return await reject("INVALID_REQUEST", 400, "JSON request body is required.")
+            body = bytearray()
+            async for chunk in http_request.stream():
+                if len(body) + len(chunk) > MAX_BODY_BYTES:
+                    return await reject("INVALID_REQUEST", 413, "Request body is too large.")
+                body.extend(chunk)
+            try:
+                payload = AgentRunRequest.model_validate(json.loads(body.decode("utf-8")))
+            except (ValueError, UnicodeDecodeError, ValidationError):
+                return await reject("INVALID_REQUEST", 400, "Invalid agent request.")
+            if payload.model not in settings.model_aliases or payload.engine not in {
+                "fixture",
+                "cloud",
+            }:
+                return await reject("INVALID_REQUEST", 400, "Unknown model or engine.")
+            supplied_id = http_request.headers.get("x-aegis-conversation-id")
+            if supplied_id is not None and CONVERSATION_ID_PATTERN.fullmatch(supplied_id) is None:
+                return await reject("INVALID_REQUEST", 400, "Invalid conversation ID.")
+            conversation_id = supplied_id or uuid4().hex
+            draft = AuditDraft(
+                request_id=task_id,
+                principal_id=principal_id,
+                conversation_id=conversation_id,
+                status="PENDING",
+                model_alias=payload.model,
+                prompt_hmac=hmac.new(
+                    settings.hmac_key.encode("utf-8"), payload.input.encode("utf-8"), sha256
+                ).hexdigest(),
+                task_type="AGENT",
+            )
+            try:
+                begin = await store.begin_request(draft)
+            except Exception:
+                return _error(
+                    503,
+                    "AUDIT_UNAVAILABLE",
+                    "Audit storage is unavailable.",
+                    task_id,
+                    conversation_id,
+                )
+            if begin.status == "BUSY":
+                return _error(
+                    409,
+                    "CONVERSATION_BUSY",
+                    "Conversation has an active request.",
+                    task_id,
+                    conversation_id,
+                )
+            if begin.status == "CLOSED":
+                return _error(
+                    410, "CONVERSATION_CLOSED", "Conversation is closed.", task_id, conversation_id
+                )
+            assert begin.was_sensitive is not None
+            failure: AgentFailure | None = None
+            result = None
+            try:
+                async with asyncio.timeout(60):
+                    result = await agent_service.run(
+                        task_id=task_id,
+                        principal_id=principal_id,
+                        model_alias=payload.model,
+                        input_text=payload.input,
+                        engine=payload.engine,
+                        was_sensitive=begin.was_sensitive,
+                    )
+            except AgentFailure as exc:
+                failure = exc
+            except TimeoutError:
+                failure = AgentFailure(504, "TASK_TIMEOUT", "Agent task timed out.")
+            except asyncio.CancelledError:
+                try:
+                    await store.finish_dispatch(
+                        task_id,
+                        status="FAILED",
+                        error_code="REQUEST_CANCELLED",
+                        duration_ms=max(0, round((time.perf_counter() - started) * 1000)),
+                    )
+                except Exception:
+                    pass
+                raise
+            except Exception:
+                failure = AgentFailure(502, "AGENT_ERROR", "Agent task failed.")
+            try:
+                await store.finish_dispatch(
+                    task_id,
+                    status="SUCCEEDED"
+                    if failure is None
+                    else "BLOCKED"
+                    if failure.http_status == 403
+                    else "FAILED",
+                    error_code=failure.code if failure else None,
+                    duration_ms=max(0, round((time.perf_counter() - started) * 1000)),
+                )
+            except Exception:
+                return _error(
+                    503,
+                    "AUDIT_UNAVAILABLE",
+                    "Audit storage is unavailable.",
+                    task_id,
+                    conversation_id,
+                )
+            if failure is not None:
+                return _error(
+                    failure.http_status, failure.code, failure.message, task_id, conversation_id
+                )
+            assert result is not None
+            return JSONResponse(
+                {"task_id": task_id, "answer": result.answer, "sources": result.sources},
+                headers={"X-Aegis-Request-Id": task_id, "X-Aegis-Conversation-Id": conversation_id},
+            )
 
     @app.post("/v1/chat/completions")
     async def chat_completions(http_request: Request) -> JSONResponse:

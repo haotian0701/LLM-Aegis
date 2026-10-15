@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, feat/frontend-console]
+    branches: [main, feat/frontend-console, feat/runtime-firewall]
   pull_request:
     branches: [main]
   workflow_dispatch:

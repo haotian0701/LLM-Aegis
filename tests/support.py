@@ -12,7 +12,14 @@ from aegis.policy import Action, Category
 from aegis.provider import ProviderResult
 from aegis.schemas import ChatRequest
 from aegis.semantic import OpenAICompatibleSemanticDetector
-from aegis.store import AuditDraft, AuditSummary, BeginResult, ConversationSummary
+from aegis.store import (
+    AuditDraft,
+    AuditSummary,
+    BeginResult,
+    ConversationSummary,
+    StepDraft,
+    StepSummary,
+)
 
 HMAC_KEY = "test-hmac-key-longer-than-thirty-two-bytes"
 DB_URL = "postgresql+psycopg://unused:unused@localhost/unused"
@@ -21,6 +28,7 @@ DB_URL = "postgresql+psycopg://unused:unused@localhost/unused"
 class MemoryStore:
     def __init__(self) -> None:
         self.events: dict[str, dict[str, Any]] = {}
+        self.steps: dict[str, list[dict[str, Any]]] = {}
         self.conversations: dict[tuple[str, str], bool] = {}
         self.active: dict[tuple[str, str], str] = {}
         self.closed: set[tuple[str, str]] = set()
@@ -58,6 +66,8 @@ class MemoryStore:
             detector_durations_ms=event.get("detector_durations_ms"),
             total_duration_ms=event.get("total_duration_ms"),
             masked_messages=event.get("masked_messages"),
+            task_type=event.get("task_type", "CHAT"),
+            steps=[StepSummary(**step) for step in self.steps.get(request_id, [])],
         )
 
     async def list_audits(
@@ -162,6 +172,81 @@ class MemoryStore:
             return BeginResult("BUSY")
         self.active[key] = draft.request_id
         return BeginResult("CLAIMED", self.conversations[key])
+
+    async def start_step(
+        self,
+        draft: StepDraft,
+        *,
+        model_action: Action | None = None,
+        simulation: bool = False,
+        upgrade_sensitive: bool = False,
+    ) -> None:
+        if self.fail_intent:
+            raise RuntimeError("database unavailable")
+        event = self.events[draft.task_id]
+        key = (event["principal_id"], event["conversation_id"])
+        assert self.active[key] == draft.task_id
+        assert event["task_type"] == "AGENT"
+        if upgrade_sensitive and not self.conversations[key]:
+            self.conversations[key] = True
+            self.versions[key] += 1
+        if model_action is not None:
+            event.update(
+                policy_action=model_action.value,
+                simulation=simulation,
+                detected_categories=draft.data_categories,
+                detection_status="COMPLETE",
+                conversation_state_after="SENSITIVE" if self.conversations[key] else "NORMAL",
+                conversation_state_version=self.versions[key],
+                blocked=model_action == Action.BLOCK,
+            )
+        steps = self.steps.setdefault(draft.task_id, [])
+        steps.append(
+            {
+                **vars(draft),
+                "sequence": len(steps) + 1,
+                "started_at": datetime.now(UTC),
+                "finished_at": datetime.now(UTC) if draft.execution_status != "PENDING" else None,
+                "error_code": None,
+            }
+        )
+
+    async def finish_step(
+        self,
+        step_id: str,
+        *,
+        execution_status: str,
+        executed: bool | None,
+        actual_destination: str,
+        error_code: str | None = None,
+    ) -> None:
+        if self.fail_finish:
+            raise RuntimeError("database unavailable")
+        for task_id, steps in self.steps.items():
+            for step in steps:
+                if step["step_id"] == step_id:
+                    assert step["execution_status"] == "PENDING"
+                    step.update(
+                        execution_status=execution_status,
+                        executed=executed,
+                        actual_destination=actual_destination,
+                        error_code=error_code,
+                        finished_at=datetime.now(UTC),
+                    )
+                    event = self.events[task_id]
+                    if step["kind"] == "MODEL_REQUEST":
+                        event.update(
+                            actual_destination=actual_destination,
+                            model_call_status=execution_status,
+                            provider_name=step["source"],
+                        )
+                    elif step["kind"] == "SEMANTIC_CHECK":
+                        event.update(
+                            semantic_destination=actual_destination,
+                            semantic_call_status=execution_status,
+                        )
+                    return
+        raise RuntimeError("step not found")
 
     async def record_external_intent(
         self, request_id: str, *, provider_name: str, model: str
@@ -286,6 +371,15 @@ class MemoryStore:
             event["detected_categories"] = detected_categories
         if detector_durations_ms is not None:
             event["detector_durations_ms"] = detector_durations_ms
+        if event.get("task_type") == "AGENT":
+            for step in self.steps.get(request_id, []):
+                if step["execution_status"] == "PENDING":
+                    step.update(
+                        execution_status="UNKNOWN",
+                        executed=None,
+                        error_code=error_code or "TASK_INTERRUPTED",
+                        finished_at=datetime.now(UTC),
+                    )
         del self.active[key]
 
 

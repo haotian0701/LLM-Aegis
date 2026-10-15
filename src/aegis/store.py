@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Literal, Protocol
 from uuid import uuid4
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from aegis.models import AuditEvent, Conversation, ConversationAdminEvent
+from aegis.models import AuditEvent, AuditStep, Conversation, ConversationAdminEvent
 from aegis.policy import Action
 
 
@@ -24,6 +24,45 @@ class AuditDraft:
     model_alias: str | None
     prompt_hmac: str | None
     error_code: str | None = None
+    task_type: str = "CHAT"
+
+
+@dataclass(frozen=True)
+class StepDraft:
+    step_id: str
+    task_id: str
+    kind: str
+    source: str
+    target: str
+    input_summary: str
+    policy_version: str
+    matched_rules: list[str]
+    data_categories: list[str]
+    decision: str
+    execution_status: str = "PENDING"
+    executed: bool | None = None
+    actual_destination: str = "NONE"
+
+
+@dataclass(frozen=True)
+class StepSummary:
+    step_id: str
+    task_id: str
+    sequence: int
+    kind: str
+    source: str
+    target: str
+    input_summary: str
+    policy_version: str
+    matched_rules: list[str]
+    data_categories: list[str]
+    decision: str
+    execution_status: str
+    executed: bool | None
+    actual_destination: str
+    started_at: datetime | None
+    finished_at: datetime | None
+    error_code: str | None
 
 
 @dataclass(frozen=True)
@@ -56,6 +95,8 @@ class AuditSummary:
     detector_durations_ms: dict[str, int] | None = None
     total_duration_ms: int | None = None
     masked_messages: list[dict[str, object]] | None = None
+    task_type: str = "CHAT"
+    steps: list[StepSummary] | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +127,25 @@ def _state(conversation: Conversation) -> str:
 
 
 class RequestStore(Protocol):
+    async def start_step(
+        self,
+        draft: StepDraft,
+        *,
+        model_action: Action | None = None,
+        simulation: bool = False,
+        upgrade_sensitive: bool = False,
+    ) -> None: ...
+
+    async def finish_step(
+        self,
+        step_id: str,
+        *,
+        execution_status: str,
+        executed: bool | None,
+        actual_destination: str,
+        error_code: str | None = None,
+    ) -> None: ...
+
     async def get_audit_summary(
         self, request_id: str, principal_id: str
     ) -> AuditSummary | None: ...
@@ -186,6 +246,7 @@ class PostgresRequestStore:
             detector_durations_ms=event.detector_durations_ms,
             total_duration_ms=event.total_duration_ms,
             masked_messages=event.masked_messages if include_masked_messages else None,
+            task_type=event.task_type,
         )
 
     async def get_audit_summary(self, request_id: str, principal_id: str) -> AuditSummary | None:
@@ -195,7 +256,40 @@ class PostgresRequestStore:
                     AuditEvent.request_id == request_id, AuditEvent.principal_id == principal_id
                 )
             )
-            return self._summary(event, include_masked_messages=True) if event is not None else None
+            if event is None:
+                return None
+            steps = (
+                await session.scalars(
+                    select(AuditStep)
+                    .where(AuditStep.task_id == request_id)
+                    .order_by(AuditStep.sequence)
+                )
+            ).all()
+            return replace(
+                self._summary(event, include_masked_messages=True),
+                steps=[
+                    StepSummary(
+                        step_id=step.step_id,
+                        task_id=step.task_id,
+                        sequence=step.sequence,
+                        kind=step.kind,
+                        source=step.source,
+                        target=step.target,
+                        input_summary=step.input_summary,
+                        policy_version=step.policy_version,
+                        matched_rules=step.matched_rules,
+                        data_categories=step.data_categories,
+                        decision=step.decision,
+                        execution_status=step.execution_status,
+                        executed=step.executed,
+                        actual_destination=step.actual_destination,
+                        started_at=step.started_at,
+                        finished_at=step.finished_at,
+                        error_code=step.error_code,
+                    )
+                    for step in steps
+                ],
+            )
 
     async def list_audits(
         self,
@@ -250,6 +344,7 @@ class PostgresRequestStore:
     def _event(draft: AuditDraft) -> AuditEvent:
         return AuditEvent(
             request_id=draft.request_id,
+            task_type=draft.task_type,
             principal_id=draft.principal_id,
             conversation_id=draft.conversation_id,
             status=draft.status,
@@ -343,6 +438,85 @@ class PostgresRequestStore:
         ):
             raise RuntimeError("request does not own the conversation")
         return conversation, event
+
+    async def start_step(
+        self,
+        draft: StepDraft,
+        *,
+        model_action: Action | None = None,
+        simulation: bool = False,
+        upgrade_sensitive: bool = False,
+    ) -> None:
+        async with self._sessions() as session, session.begin():
+            conversation, event = await self._owned_event(session, draft.task_id)
+            if event.task_type != "AGENT":
+                raise RuntimeError("steps require an agent task")
+            sequence = (
+                await session.scalar(
+                    select(func.max(AuditStep.sequence)).where(AuditStep.task_id == draft.task_id)
+                )
+                or 0
+            ) + 1
+            if upgrade_sensitive and not conversation.sensitive:
+                conversation.sensitive = True
+                conversation.state_version += 1
+                conversation.updated_at = datetime.now(UTC)
+            if model_action is not None:
+                event.policy_action = model_action.value
+                event.simulation = simulation
+                event.detected_categories = draft.data_categories
+                event.detection_status = "COMPLETE"
+                event.conversation_state_after = _state(conversation)
+                event.conversation_state_version = conversation.state_version
+                event.blocked = model_action == Action.BLOCK
+            session.add(
+                AuditStep(
+                    step_id=draft.step_id,
+                    task_id=draft.task_id,
+                    sequence=sequence,
+                    kind=draft.kind,
+                    source=draft.source,
+                    target=draft.target,
+                    input_summary=draft.input_summary,
+                    policy_version=draft.policy_version,
+                    matched_rules=draft.matched_rules,
+                    data_categories=draft.data_categories,
+                    decision=draft.decision,
+                    execution_status=draft.execution_status,
+                    executed=draft.executed,
+                    actual_destination=draft.actual_destination,
+                    finished_at=(
+                        datetime.now(UTC) if draft.execution_status != "PENDING" else None
+                    ),
+                )
+            )
+
+    async def finish_step(
+        self,
+        step_id: str,
+        *,
+        execution_status: str,
+        executed: bool | None,
+        actual_destination: str,
+        error_code: str | None = None,
+    ) -> None:
+        async with self._sessions() as session, session.begin():
+            step = await session.get(AuditStep, step_id, with_for_update=True)
+            if step is None or step.execution_status != "PENDING":
+                raise RuntimeError("step is unavailable or already finished")
+            _, event = await self._owned_event(session, step.task_id)
+            step.execution_status = execution_status
+            step.executed = executed
+            step.actual_destination = actual_destination
+            step.error_code = error_code
+            step.finished_at = datetime.now(UTC)
+            if step.kind == "MODEL_REQUEST":
+                event.actual_destination = actual_destination
+                event.model_call_status = execution_status
+                event.provider_name = step.source
+            elif step.kind == "SEMANTIC_CHECK":
+                event.semantic_destination = actual_destination
+                event.semantic_call_status = execution_status
 
     async def record_external_intent(
         self, request_id: str, *, provider_name: str, model: str
@@ -482,6 +656,21 @@ class PostgresRequestStore:
             if event.conversation_state_after is None:
                 event.conversation_state_after = _state(conversation)
                 event.conversation_state_version = conversation.state_version
+
+            if event.task_type == "AGENT":
+                pending_steps = (
+                    await session.scalars(
+                        select(AuditStep).where(
+                            AuditStep.task_id == request_id,
+                            AuditStep.execution_status == "PENDING",
+                        )
+                    )
+                ).all()
+                for step in pending_steps:
+                    step.execution_status = "UNKNOWN"
+                    step.executed = None
+                    step.error_code = error_code or "TASK_INTERRUPTED"
+                    step.finished_at = datetime.now(UTC)
             conversation.active_request_id = None
             conversation.active_since = None
 

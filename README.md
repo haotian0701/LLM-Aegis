@@ -96,6 +96,22 @@ $env:AEGIS_MODEL_ALIASES_JSON = '{"aegis-mock":"replace-with-cloud-model-id"}'
 
 The classifier must return JSON with exactly one `CLEAR`, `BUSINESS_SECRET`, or `UNCERTAIN` label for every input text ID; missing or uncertain results fail closed. The optional `AEGIS_DEMO_PROVIDER=simulated_local` setting uses the configured cloud provider for `LOCAL` decisions and records the actual external destination. For frontend development, start the Python API, then run `npm run dev` in `frontend/`.
 
+## Controlled task demo (Runtime Firewall stages 0–1)
+
+In `demo` mode, the same Console workspace can run a synthetic task and show an ordered audit timeline for each model, retrieval, tool-call, and tool-result boundary. The fixed fixture accepts these three prompts: `Summarize the authorized launch notes.`, `Summarize the suspicious operations note.`, and `Show the timeout scenario.` The first returns an authorized synthetic document and source. The second causes the fake model to propose `send_email`; the independent tool policy denies it before the adapter runs. The third records an unknown result after a synthetic tool timeout. Retrieval excludes documents belonging to other principals.
+
+The separate `POST /v1/agent/runs` endpoint is available only in `demo` mode. It accepts an API bearer token (or the loopback Console token), the existing optional `X-Aegis-Conversation-Id` header, and a JSON body such as:
+
+```json
+{"model":"aegis-mock","input":"Summarize the authorized launch notes.","engine":"fixture"}
+```
+
+`engine` defaults to `fixture`; success returns `task_id`, `answer`, and permitted document `sources`. Errors use the gateway's existing error envelope. The task ID is also the `X-Aegis-Request-Id` and can be inspected through the demo audit drawer. Step records retain metadata and digests, not raw document bodies or complete tool arguments.
+
+Selecting `engine=cloud` accepts synthetic free-text tasks and uses the configured OpenAI-compatible model for structured tool calls. It requires the external semantic classifier; that classifier sees original task and tool-result text before model masking. Every model request uses the existing four route policy. `MASK_CLOUD` sends masked text, and `LOCAL` cannot silently use a cloud model unless the process explicitly selects `simulated_local`. Cloud tool calls still pass the same independent tool policy. Use only synthetic inputs with external services.
+
+This stage uses a fixed document fixture and local fake tool adapter. An MCP server, a full RAG pipeline, external MCP proxying, and real write operations are outside the implemented stage.
+
 ## Verification
 
 ```powershell

@@ -103,6 +103,25 @@ try {
   await page.getByText('3 messages', { exact: true }).waitFor()
   assert.ok(await page.getByText('First chat turn').first().isVisible())
 
+  for (const [example, expected] of [
+    ['Authorized document', 'The synthetic launch window is Tuesday'],
+    ['Malicious document', 'TOOL_DENIED'],
+    ['Tool timeout', 'TOOL_TIMEOUT'],
+  ]) {
+    await page.getByRole('button', { name: 'New conversation' }).click()
+    await page.getByRole('button', { name: new RegExp(example) }).click()
+    await page.getByRole('button', { name: 'Run task' }).click()
+    await page.locator('#decision').getByText(expected, { exact: false }).waitFor()
+    await page.getByRole('button', { name: 'Find', exact: true }).click()
+    await drawer.getByRole('region', { name: 'Task step timeline' }).waitFor()
+    if (example === 'Malicious document') {
+      await drawer.getByText('Rule: write_tool_disabled').waitFor()
+      await drawer.getByText('Executed: No').first().waitFor()
+    }
+    if (example === 'Tool timeout') await drawer.getByText('Execution: UNKNOWN').waitFor()
+    await drawer.getByRole('button', { name: 'Close' }).click()
+  }
+
   await page.setViewportSize({ width: 390, height: 844 })
   await page.locator('#audit tbody tr').first().getByRole('button', { name: 'Inspect' }).click()
   await drawer.getByText('SELECTED AUDIT RECORD').waitFor()
@@ -120,7 +139,7 @@ try {
   assert.equal(await page.locator('#conversation-lookup').inputValue(), '')
   await page.screenshot({ path: '../.tools/browser-narrow.png', fullPage: true })
   console.log(
-    'Browser smoke passed: four routes, audit lookup, chat preview, narrow layout, keyboard action.',
+    'Browser smoke passed: four routes, controlled tasks, audit timeline, chat preview, narrow layout, keyboard action.',
   )
 } finally {
   await browser?.close()

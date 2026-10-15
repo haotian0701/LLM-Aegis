@@ -248,6 +248,49 @@
   gap: 18px;
   margin-bottom: 18px;
 }
+.agentExamples {
+  margin: 0 0 22px;
+}
+.stepTimeline {
+  margin-top: 24px;
+  border-top: 1px solid #e3e8ee;
+  padding-top: 20px;
+}
+.stepTimeline h4 {
+  margin: 0 0 14px;
+}
+.stepTimeline ol {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+.stepTimeline li {
+  border: 1px solid #dce4ed;
+  border-radius: 10px;
+  padding: 14px;
+  background: #fbfcfe;
+  overflow-wrap: anywhere;
+}
+.stepHeading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+.stepTimeline p {
+  margin: 9px 0 0;
+  font-size: 12px;
+}
+.stepMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin-top: 10px;
+  font-size: 11px;
+  color: #56687d;
+}
 .panel {
   background: white;
   border: 1px solid #e3e8ee;
