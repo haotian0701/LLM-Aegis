@@ -250,7 +250,12 @@ class WorkspaceWorkflow:
         seen: set[str] = set()
         for _ in range(5):
             content, proposal, was_sensitive = await self.model_gate._model_turn(
-                task_id, payload.model, messages, "cloud", was_sensitive
+                task_id,
+                payload.model,
+                messages,
+                "cloud",
+                was_sensitive,
+                trusted_system=True,
             )
             if proposal is None:
                 if not seen:

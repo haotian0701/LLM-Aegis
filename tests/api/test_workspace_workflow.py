@@ -11,6 +11,7 @@ import pytest
 
 from aegis.agent_provider import AgentTurn, ProposedToolCall
 from aegis.main import create_app
+from aegis.semantic import SemanticDetectionError
 from tests.support import EmptyNer, FakeSemantic, MemoryStore, settings
 
 
@@ -38,6 +39,12 @@ class Screen:
         return "INJECTION" if "ignore prior instructions" in text else "CLEAR"
 
 
+class UncertainSemantic(FakeSemantic):
+    async def detect(self, fragments: Any) -> Any:
+        self.calls.append(fragments)
+        raise SemanticDetectionError("semantic classifier was uncertain", reason="UNCERTAIN")
+
+
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
@@ -47,7 +54,7 @@ def repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def app(repo: Path, store: MemoryStore, model: Model) -> Any:
+def app(repo: Path, store: MemoryStore, model: Model, semantic: FakeSemantic | None = None) -> Any:
     config = settings().model_copy(
         update={
             "cloud_base_url": "https://model.example/v1",
@@ -61,7 +68,7 @@ def app(repo: Path, store: MemoryStore, model: Model) -> Any:
         config,
         store=store,
         ner_detector=EmptyNer(),
-        semantic_detector=FakeSemantic(),
+        semantic_detector=semantic or FakeSemantic(),
         agent_model=model,
         injection_detector=Screen(),
         workspace_root=repo,
@@ -78,8 +85,9 @@ async def token(client: httpx.AsyncClient) -> str:
 async def test_real_tracked_file_is_read_and_sent_to_model(repo: Path) -> None:
     store = MemoryStore()
     model = Model()
+    semantic = FakeSemantic()
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app(repo, store, model)),
+        transport=httpx.ASGITransport(app=app(repo, store, model, semantic)),
         base_url="http://127.0.0.1",
     ) as client:
         demo_token = await token(client)
@@ -94,6 +102,9 @@ async def test_real_tracked_file_is_read_and_sent_to_model(repo: Path) -> None:
         assert body["sources"][0]["source"] == "README.md"
         assert "routing is audited" in model.requests[1].messages[-1].content
         assert "do-not-read" not in model.requests[1].messages[-1].content
+        assert semantic.calls
+        assert all(fragment.message_index != 0 for call in semantic.calls for fragment in call)
+        assert any(fragment.path == "messages[1].content" for fragment in semantic.calls[0])
         detail = await client.get(
             f"/demo/audit/{body['task_id']}",
             headers={"Authorization": f"Bearer {demo_token}"},
@@ -216,3 +227,27 @@ async def test_audit_intent_failure_stops_tool(repo: Path) -> None:
         assert response.status_code == 503
         assert response.json()["error"]["code"] == "AUDIT_UNAVAILABLE"
         assert model.requests == []
+
+
+@pytest.mark.asyncio
+async def test_uncertain_classifier_has_explicit_reason_and_stops_model(repo: Path) -> None:
+    store = MemoryStore()
+    model = Model()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app(repo, store, model, UncertainSemantic())),
+        base_url="http://127.0.0.1",
+    ) as client:
+        demo_token = await token(client)
+        response = await client.post(
+            "/v1/workflows/workspace",
+            headers={"Authorization": f"Bearer {demo_token}"},
+            json={"model": "aegis-mock", "input": "Where is routing?"},
+        )
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "SEMANTIC_UNCERTAIN"
+        assert model.requests == []
+        detail = await client.get(
+            f"/demo/audit/{response.headers['X-Aegis-Request-Id']}",
+            headers={"Authorization": f"Bearer {demo_token}"},
+        )
+        assert detail.json()["steps"][0]["error_code"] == "SEMANTIC_UNCERTAIN"

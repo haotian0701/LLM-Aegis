@@ -39,7 +39,7 @@ from aegis.runtime_policy import (
     decide_document,
 )
 from aegis.schemas import ChatMessage, ChatRequest, ToolCall
-from aegis.semantic import SemanticDetector
+from aegis.semantic import SemanticDetectionError, SemanticDetector
 from aegis.store import RequestStore, StepDraft
 
 
@@ -172,11 +172,20 @@ class AgentService:
         messages: list[ChatMessage],
         engine: str,
         was_sensitive: bool,
+        *,
+        trusted_system: bool = False,
     ) -> tuple[str | None, ProposedToolCall | None, bool]:
         request = ChatRequest(model=model_alias, messages=messages)
-        fragments = extract_fragments(request)
-        if text_bytes(fragments) > self.MAX_TEXT_BYTES:
+        all_fragments = extract_fragments(request)
+        if text_bytes(all_fragments) > self.MAX_TEXT_BYTES:
             raise AgentFailure(413, "INVALID_REQUEST", "Task context is too large.")
+        if trusted_system and (not messages or messages[0].role != "system"):
+            raise ValueError("trusted system message is missing")
+        fragments = (
+            [fragment for fragment in all_fragments if fragment.message_index != 0]
+            if trusted_system
+            else all_fragments
+        )
         try:
             findings = self.rule_detector.detect(fragments)
             initial_action = self.policy.decide(
@@ -222,6 +231,22 @@ class AgentService:
             )
             try:
                 findings.extend(await detector.detect(fragments))
+            except SemanticDetectionError as exc:
+                if exc.reason == "UNCERTAIN":
+                    await self._finish(
+                        step_id, "FAILED", None, detector.destination, "SEMANTIC_UNCERTAIN"
+                    )
+                    raise AgentFailure(
+                        403,
+                        "SEMANTIC_UNCERTAIN",
+                        "Classifier could not determine whether this task may leave the machine.",
+                    ) from exc
+                await self._finish(
+                    step_id, "FAILED", None, detector.destination, "SECURITY_UNAVAILABLE"
+                )
+                raise AgentFailure(
+                    503, "SECURITY_UNAVAILABLE", "Semantic detection failed."
+                ) from exc
             except Exception as exc:
                 await self._finish(
                     step_id, "FAILED", None, detector.destination, "SECURITY_UNAVAILABLE"
